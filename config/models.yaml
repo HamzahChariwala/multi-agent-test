@@ -1,0 +1,19 @@
+small_model:
+  name: "mistralai/Mistral-7B-Instruct-v0.2"
+  node: "t4"
+  gpus: [0, 1, 2, 3]
+  precision: "bf16"
+  
+large_model:
+  name: "meta-llama/Llama-2-70b-chat-hf"
+  node: "a100"
+  gpus: [0, 1]
+  precision: "bf16"
+  
+chairman_model:
+  name: "meta-llama/Llama-2-70b-chat-hf"
+  node: "a100"
+  gpus: [2, 3]
+  tensor_parallel: 2
+  precision: "bf16"
+

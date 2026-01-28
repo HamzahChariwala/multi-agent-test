@@ -1,0 +1,42 @@
+members:
+  - id: "member_1"
+    url: "http://localhost:8001"
+    temperature: 0.3
+    node: "t4"
+    gpu: 1
+  
+  - id: "member_2"
+    url: "http://localhost:8002"
+    temperature: 0.7
+    node: "t4"
+    gpu: 2
+  
+  - id: "member_3"
+    url: "http://localhost:8003"
+    temperature: 1.0
+    node: "t4"
+    gpu: 3
+  
+  - id: "member_4"
+    url: "http://localhost:8010"
+    temperature: 0.3
+    node: "a100"
+    gpu: 0
+  
+  - id: "member_5"
+    url: "http://localhost:8011"
+    temperature: 0.8
+    node: "a100"
+    gpu: 1
+
+chairman:
+  url: "http://localhost:8020"
+  node: "a100"
+  gpus: [2, 3]
+
+# Timeout settings (seconds)
+timeouts:
+  generation: 120
+  judging: 60
+  chairman: 180
+

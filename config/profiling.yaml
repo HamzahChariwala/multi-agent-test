@@ -1,0 +1,60 @@
+enabled: true
+output_base_dir: "./profiling_traces"
+
+# Per-GPU profiling settings
+gpus:
+  t4_gpu0:
+    enabled: true
+    operations: ["prefill", "kv_broadcast"]
+    with_stack: true
+    record_shapes: true
+  
+  t4_gpu1:
+    enabled: true
+    operations: ["decode", "kv_receive"]
+    with_stack: true
+    record_shapes: true
+  
+  t4_gpu2:
+    enabled: true
+    operations: ["decode", "kv_receive"]
+    with_stack: true
+    record_shapes: true
+  
+  t4_gpu3:
+    enabled: true
+    operations: ["decode", "kv_receive"]
+    with_stack: true
+    record_shapes: true
+  
+  a100_gpu0:
+    enabled: true
+    operations: ["prefill", "decode", "kv_fork"]
+    with_stack: true
+    record_shapes: true
+  
+  a100_gpu1:
+    enabled: true
+    operations: ["decode", "kv_receive"]
+    with_stack: true
+    record_shapes: true
+  
+  chairman_tp:
+    enabled: true
+    operations: ["synthesis", "tp_communication"]
+    with_stack: true
+    record_shapes: true
+
+# ExecutionTraceObserver settings
+execution_trace:
+  enabled: true
+  export_format: "json"  # or "pickle"
+  include_operator_inputs: false  # save space
+
+# Profiling control
+schedule:
+  wait: 1
+  warmup: 1
+  active: 3
+  repeat: 1
+
