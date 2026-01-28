@@ -53,6 +53,7 @@ class ProfilerContext:
         
         self.profiler = None
         self.et_file = None
+        self.et_observer = None
     
     def _load_config(self, config_path: str) -> dict:
         """Load profiling configuration from YAML."""
@@ -67,20 +68,18 @@ class ProfilerContext:
         if not self.enabled:
             return self
         
-        # Setup ExecutionTraceObserver
+        # Setup ExecutionTraceObserver if enabled
         et_config = self.config.get("execution_trace", {})
-        if et_config.get("enabled", True):
+        self.et_observer = None
+        if et_config.get("enabled", False):
             et_format = et_config.get("export_format", "json")
             self.et_file = str(self.output_dir / f"{self.request_id}_et.{et_format}")
-        
-        # Configure profiling schedule
-        schedule_config = self.config.get("schedule", {})
-        schedule = torch.profiler.schedule(
-            wait=schedule_config.get("wait", 1),
-            warmup=schedule_config.get("warmup", 1),
-            active=schedule_config.get("active", 3),
-            repeat=schedule_config.get("repeat", 1)
-        )
+            
+            # Create and register ExecutionTraceObserver
+            # This captures CPU-side execution graph
+            self.et_observer = torch.profiler.ExecutionTraceObserver()
+            self.et_observer.register_callback(self.et_file)
+            self.et_observer.start()
         
         # Configure what to record
         activities = [
@@ -88,20 +87,24 @@ class ProfilerContext:
             torch.profiler.ProfilerActivity.CUDA,
         ]
         
-        # Create profiler
-        self.profiler = torch.profiler.profile(
-            activities=activities,
-            schedule=schedule,
-            on_trace_ready=self._trace_handler,
-            record_shapes=self.gpu_config.get("record_shapes", True),
-            profile_memory=True,
-            with_stack=self.gpu_config.get("with_stack", True),
-            with_flops=True,
-            with_modules=False,
-            experimental_config=torch._C._profiler._ExperimentalConfig(
+        # Create profiler WITHOUT schedule for minimal overhead
+        # Just capture the entire request in one go
+        profiler_kwargs = {
+            "activities": activities,
+            "record_shapes": self.gpu_config.get("record_shapes", False),
+            "profile_memory": False,  # Disable for lower overhead
+            "with_stack": self.gpu_config.get("with_stack", False),
+            "with_flops": False,  # Disable for lower overhead
+            "with_modules": False,
+        }
+        
+        # Add experimental config if needed for better trace detail
+        if self.et_observer:
+            profiler_kwargs["experimental_config"] = torch._C._profiler._ExperimentalConfig(
                 verbose=True
-            ) if self.et_file else None
-        )
+            )
+        
+        self.profiler = torch.profiler.profile(**profiler_kwargs)
         
         self.profiler.__enter__()
         return self
@@ -111,31 +114,25 @@ class ProfilerContext:
         if not self.enabled or self.profiler is None:
             return False
         
+        # Stop ExecutionTraceObserver first
+        if self.et_observer is not None:
+            try:
+                self.et_observer.stop()
+                self.et_observer.unregister_callback()
+                print(f"Exported ExecutionTrace to: {self.et_file}")
+            except Exception as e:
+                print(f"Warning: Could not export ExecutionTrace: {e}")
+        
         self.profiler.__exit__(exc_type, exc_val, exc_tb)
+        
+        # Export Chrome trace directly (no schedule means no on_trace_ready callback)
+        trace_file = self.output_dir / f"{self.request_id}_trace.json"
+        self.profiler.export_chrome_trace(str(trace_file))
         
         # Export summary
         self._export_summary()
         
         return False
-    
-    def _trace_handler(self, prof):
-        """Handle trace export."""
-        # Export Chrome trace
-        trace_file = self.output_dir / f"{self.request_id}_trace.json"
-        prof.export_chrome_trace(str(trace_file))
-        
-        # Export ExecutionTrace if configured
-        if self.et_file:
-            try:
-                # ExecutionTraceObserver export
-                et_config = self.config.get("execution_trace", {})
-                include_inputs = et_config.get("include_operator_inputs", False)
-                
-                # Export using the profiler's export functionality
-                if hasattr(prof, 'export_execution_trace'):
-                    prof.export_execution_trace(self.et_file)
-            except Exception as e:
-                print(f"Warning: Could not export ExecutionTrace: {e}")
     
     def _export_summary(self):
         """Export profiling summary statistics."""
@@ -195,8 +192,8 @@ class ProfilerContext:
     
     def step(self):
         """Advance profiler to next step (for iterative operations)."""
-        if self.enabled and self.profiler is not None:
-            self.profiler.step()
+        # No-op when not using schedule - profiler runs continuously
+        pass
 
 
 @contextmanager

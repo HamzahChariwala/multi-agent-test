@@ -6,6 +6,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    AutoConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
 )
@@ -58,6 +59,18 @@ def load_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Load config and patch if needed (e.g., Phi-2 missing pad_token_id)
+    config = AutoConfig.from_pretrained(
+        model_name,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
+    )
+    
+    # Add missing pad_token_id if not present
+    if not hasattr(config, 'pad_token_id') or config.pad_token_id is None:
+        config.pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else tokenizer.eos_token_id
+        print(f"Added pad_token_id={config.pad_token_id} to config")
+    
     # Load model with device mapping
     if tp_size > 1 and tp_rank is not None:
         # Tensor parallel loading
@@ -67,6 +80,7 @@ def load_model(
         
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            config=config,
             cache_dir=cache_dir,
             torch_dtype=dtype,
             trust_remote_code=True,
@@ -79,6 +93,7 @@ def load_model(
         # Standard loading
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            config=config,
             cache_dir=cache_dir,
             torch_dtype=dtype,
             trust_remote_code=True,
