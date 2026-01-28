@@ -2,59 +2,54 @@ enabled: true
 output_base_dir: "./profiling_traces"
 
 # Per-GPU profiling settings
+# Each GPU generates ONE continuous trace per request, capturing all operations
 gpus:
   t4_gpu0:
     enabled: true
-    operations: ["prefill", "kv_broadcast"]
-    with_stack: true
-    record_shapes: true
+    with_stack: false  # Stack traces add significant overhead
+    record_shapes: false  # Shape recording adds overhead
   
   t4_gpu1:
     enabled: true
-    operations: ["decode", "kv_receive"]
-    with_stack: true
-    record_shapes: true
+    with_stack: false
+    record_shapes: false
   
   t4_gpu2:
     enabled: true
-    operations: ["decode", "kv_receive"]
-    with_stack: true
-    record_shapes: true
+    with_stack: false
+    record_shapes: false
   
   t4_gpu3:
     enabled: true
-    operations: ["decode", "kv_receive"]
-    with_stack: true
-    record_shapes: true
+    with_stack: false
+    record_shapes: false
   
   a100_gpu0:
     enabled: true
-    operations: ["prefill", "decode", "kv_fork"]
     with_stack: true
     record_shapes: true
   
   a100_gpu1:
     enabled: true
-    operations: ["decode", "kv_receive"]
     with_stack: true
     record_shapes: true
   
   chairman_tp:
     enabled: true
-    operations: ["synthesis", "tp_communication"]
     with_stack: true
     record_shapes: true
 
 # ExecutionTraceObserver settings
 execution_trace:
-  enabled: true
+  enabled: true  # Enable for execution graph analysis
   export_format: "json"  # or "pickle"
   include_operator_inputs: false  # save space
 
 # Profiling control
+# Shorter schedule for lower overhead
 schedule:
-  wait: 1
-  warmup: 1
-  active: 3
-  repeat: 1
+  wait: 0
+  warmup: 0
+  active: 2  # Profile for 2 steps only
+  repeat: 1  # Must be >= 1 to trigger trace export
 

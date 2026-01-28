@@ -1,5 +1,5 @@
 small_model:
-  name: "mistralai/Mistral-7B-Instruct-v0.2"
+  name: "microsoft/phi-2"  # 2.7B model, ~5GB in bf16 - much safer for T4
   node: "t4"
   gpus: [0, 1, 2, 3]
   precision: "bf16"
