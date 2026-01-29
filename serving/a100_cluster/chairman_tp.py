@@ -1,6 +1,10 @@
 """Chairman model with Tensor Parallelism on GPUs 2-3."""
 
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -240,6 +244,11 @@ def worker_process(tp_rank: int, tp_size: int):
         endpoint_config = yaml.safe_load(f)
     
     model_name = model_config["chairman_model"]["name"]
+    
+    # Set 8-bit loading if specified in config
+    if model_config["chairman_model"].get("load_in_8bit", False):
+        os.environ["LOAD_IN_8BIT"] = "true"
+        logger.info("8-bit quantization enabled for chairman")
     port = int(endpoint_config["chairman"]["url"].split(":")[-1])
     
     # Create worker

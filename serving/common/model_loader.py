@@ -9,6 +9,7 @@ from transformers import (
     AutoConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
+    BitsAndBytesConfig,
 )
 
 
@@ -91,14 +92,40 @@ def load_model(
         model = apply_tensor_parallel_sharding(model, tp_rank, tp_size)
     else:
         # Standard loading
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            config=config,
-            cache_dir=cache_dir,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            device_map={"": device},
-        )
+        # Check if we should use 8-bit quantization
+        load_in_8bit = os.getenv("LOAD_IN_8BIT", "false").lower() == "true"
+        
+        if load_in_8bit:
+            print(f"Loading model in 8-bit mode to save memory...")
+            # For 8-bit, we need to use device_map with the specific device
+            # Extract just the device index (e.g., "cuda:0" -> 0)
+            if ":" in device:
+                device_idx = int(device.split(":")[-1])
+            else:
+                device_idx = 0
+            
+            # Use BitsAndBytesConfig for 8-bit quantization
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+            )
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                quantization_config=bnb_config,
+                trust_remote_code=True,
+                device_map={"": device_idx},  # Map to specific GPU index
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                config=config,
+                cache_dir=cache_dir,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+                device_map={"": device},
+            )
     
     # Set to eval mode
     model.eval()
