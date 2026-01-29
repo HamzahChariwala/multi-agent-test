@@ -2,25 +2,33 @@
 
 ## Overview
 
-This guide covers deploying the distributed multi-agent council system across T4 and A100 GPU nodes.
+This guide covers deploying the two-phase council system with synthesis across T4 and A100 GPU nodes.
+
+**Architecture:**
+- **T4 Node**: 4 GPUs running council members with shared-prefill
+- **A100 Node**: 4 GPUs running single model with 4-way Tensor Parallelism for two-phase synthesis
+- **Orchestrator**: Coordinates the two-phase workflow with parallel execution
 
 ## Prerequisites
 
 ### Hardware Requirements
 
-**T4 Node:**
+**T4 Node (Council Members):**
 - 4x NVIDIA T4 GPUs (16GB each)
 - 64GB+ RAM
 - Fast inter-GPU connectivity (PCIe Gen3+)
+- Runs: 3 council members + 1 prefill server
 
-**A100 Node:**
-- 4x NVIDIA A100 GPUs (40GB or 80GB)
+**A100 Node (Synthesis with 4-way TP):**
+- 4x NVIDIA A100-80GB GPUs (**80GB required for Llama-2-70B**)
 - 128GB+ RAM
-- NVLink connectivity between GPUs
+- **NVLink connectivity required** (for efficient Tensor Parallelism)
+- All 4 GPUs dedicated to single model with TP=4
 
 **Orchestrator Node:**
-- CPU-only or 1 GPU (optional)
+- CPU-only machine (no GPU required)
 - Network connectivity to both GPU nodes
+- Coordinates two-phase workflow
 
 ### Software Requirements
 
@@ -48,60 +56,99 @@ pip install -r requirements.txt
 ### 2. Download Models
 
 ```bash
-# Set HuggingFace cache directory
+# Set HuggingFace cache directory (optional)
 export HF_HOME=/path/to/model/cache
 
-# Models will be downloaded automatically on first run
-# or pre-download:
+# Pre-download models (recommended to avoid first-run delays)
 python -c "
 from transformers import AutoModelForCausalLM, AutoTokenizer
-AutoModelForCausalLM.from_pretrained('mistralai/Mistral-7B-Instruct-v0.2')
+
+# T4 model (smaller, ~5GB)
+print('Downloading Phi-2 for T4 council...')
+AutoModelForCausalLM.from_pretrained('microsoft/phi-2')
+
+# A100 model (large, ~140GB)
+print('Downloading Llama-2-70B for A100 synthesis...')
+# Note: Requires HuggingFace authentication for Llama-2
 AutoModelForCausalLM.from_pretrained('meta-llama/Llama-2-70b-chat-hf')
 "
 ```
+
+**For Llama-2-70B Access:**
+1. Visit: https://huggingface.co/meta-llama/Llama-2-70b-chat-hf
+2. Accept the license agreement
+3. Create a token at: https://huggingface.co/settings/tokens
+4. Login: `huggingface-cli login`
+
+**Storage Requirements:**
+- Phi-2: ~5GB
+- Llama-2-70B: ~140GB (stored once, used with TP across 4 GPUs)
+- Total: ~145GB disk space
 
 ### 3. Configure Endpoints
 
 Edit `config/endpoints.yaml` to match your network setup:
 
 ```yaml
+# Council members on T4 node
 members:
   - id: "member_1"
-    url: "http://t4-node-hostname:8001"  # Update hostname
+    url: "http://t4-node-hostname:8001"
     temperature: 0.3
-  # ... etc
+    node: "t4"
+    gpu: 1
+  
+  - id: "member_2"
+    url: "http://t4-node-hostname:8002"
+    temperature: 0.7
+    node: "t4"
+    gpu: 2
+  
+  - id: "member_3"
+    url: "http://t4-node-hostname:8003"
+    temperature: 1.0
+    node: "t4"
+    gpu: 3
 
-chairman:
-  url: "http://a100-node-hostname:8020"  # Update hostname
+# Synthesis server on A100 node (4-way TP)
+synthesis:
+  url: "http://a100-node-hostname:8020"
+  node: "a100"
+  gpus: [0, 1, 2, 3]
+
+# Timeout settings (seconds)
+timeouts:
+  generation: 120
+  synthesis: 180
+  cache_timeout: 300  # 5 minutes for KV cache
 ```
 
 ## Deployment
 
 ### Option 1: Single-Node Testing (All on one machine)
 
-**Requirements:** 1 machine with 8 GPUs
+**Requirements:** 1 machine with 8 GPUs (4 T4 + 4 A100)
 
 ```bash
-# Terminal 1: T4 Cluster (uses GPUs 0-3)
+# Terminal 1: T4 Council (uses GPUs 0-3)
 cd serving/t4_cluster
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 python launcher.py
 
-# Terminal 2: A100 Large Model Twin (uses GPUs 4-5)
+# Terminal 2: A100 Synthesis Server with 4-way TP (uses GPUs 4-7)
 cd serving/a100_cluster
-CUDA_VISIBLE_DEVICES=4,5 python large_model_twin.py
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export MASTER_PORT=29500
+python synthesis_server.py
 
-# Terminal 3: Chairman (uses GPUs 6-7)
-cd serving/a100_cluster
-CUDA_VISIBLE_DEVICES=6,7 python chairman_tp.py
-
-# Terminal 4: Orchestrator
+# Terminal 3: Orchestrator
 cd orchestrator
-python main.py --mode example
+python main.py --mode two_phase
 ```
 
 ### Option 2: Multi-Node Production (Recommended)
 
-#### T4 Node Setup
+#### T4 Node Setup (Council Members)
 
 ```bash
 # SSH to T4 node
@@ -110,57 +157,72 @@ ssh user@t4-node
 cd multi-agent-test
 source venv/bin/activate
 
-# Set environment
+# Set environment for 4 GPUs
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_DEBUG=INFO
+export NCCL_DEBUG=WARN
 export NCCL_P2P_DISABLE=0
 
-# Launch T4 cluster
+# Launch T4 council cluster (3 members + prefill server)
 cd serving/t4_cluster
 python launcher.py
 ```
 
-#### A100 Node Setup - Large Model Twin
+**Expected Output:**
+```
+INFO: GPU 0 - Prefill Server started on port 8000
+INFO: GPU 1 - Member 1 started on port 8001 (temp=0.3)
+INFO: GPU 2 - Member 2 started on port 8002 (temp=0.7)
+INFO: GPU 3 - Member 3 started on port 8003 (temp=1.0)
+INFO: T4 Council ready for requests
+```
+
+#### A100 Node Setup (4-way TP Synthesis Server)
 
 ```bash
-# SSH to A100 node - Terminal 1
+# SSH to A100 node
 ssh user@a100-node
 
 cd multi-agent-test
 source venv/bin/activate
 
-# Use GPUs 0-1 for large model
-export CUDA_VISIBLE_DEVICES=0,1
-export NCCL_DEBUG=INFO
-export MASTER_PORT=29501
+# Set environment for 4-way Tensor Parallelism
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NCCL_DEBUG=WARN
+export NCCL_NET_GDR_LEVEL=5  # Enable GPU Direct RDMA for NVLink
+export MASTER_PORT=29500
 
+# Launch synthesis server with 4-way TP
 cd serving/a100_cluster
-python large_model_twin.py
+python synthesis_server.py
 ```
 
-#### A100 Node Setup - Chairman
-
-```bash
-# SSH to A100 node - Terminal 2
-# Use GPUs 2-3 for chairman
-export CUDA_VISIBLE_DEVICES=2,3
-export NCCL_DEBUG=INFO
-export MASTER_PORT=29502
-
-cd serving/a100_cluster
-python chairman_tp.py
+**Expected Output:**
+```
+INFO: [Rank 0] Initializing synthesis worker on GPU 0
+INFO: [Rank 1] Initializing synthesis worker on GPU 1
+INFO: [Rank 2] Initializing synthesis worker on GPU 2
+INFO: [Rank 3] Initializing synthesis worker on GPU 3
+INFO: Loading Llama-2-70b-chat-hf with 4-way Tensor Parallelism...
+INFO: [Rank 0] Model shard loaded (35GB)
+INFO: [Rank 1] Model shard loaded (35GB)
+INFO: [Rank 2] Model shard loaded (35GB)
+INFO: [Rank 3] Model shard loaded (35GB)
+INFO: NCCL process group initialized
+INFO: Synthesis server ready on port 8020
 ```
 
 #### Orchestrator Setup
 
 ```bash
-# SSH to orchestrator node (can be any machine)
+# SSH to orchestrator node (can be any machine with network access)
 ssh user@orchestrator-node
 
 cd multi-agent-test
 source venv/bin/activate
 
-# Update config/endpoints.yaml with actual hostnames/IPs
+# Update config/endpoints.yaml with actual hostnames/IPs:
+# - members: http://t4-node:800X
+# - synthesis: http://a100-node:8020
 
 cd orchestrator
 python main.py --mode interactive
@@ -182,13 +244,25 @@ export ENABLE_PROFILING=false
 
 Configure per-GPU profiling in `config/profiling.yaml`.
 
-### Model Selection
+### Model Configuration
 
-Edit `config/models.yaml` to use different models:
+Edit `config/models.yaml`:
 
 ```yaml
-small_model:
-  name: "mistralai/Mistral-7B-Instruct-v0.2"  # Or any compatible model
+# T4 Council Members
+t4_model:
+  name: "microsoft/phi-2"
+  node: "t4"
+  gpus: [0, 1, 2, 3]  # GPU 0 = prefill, GPUs 1-3 = members
+  precision: "bf16"
+
+# A100 Synthesis (4-way TP)
+synthesis_model:
+  name: "meta-llama/Llama-2-70b-chat-hf"
+  node: "a100"
+  gpus: [0, 1, 2, 3]  # All 4 GPUs for TP
+  tensor_parallel: 4
+  precision: "bf16"
   
 large_model:
   name: "meta-llama/Llama-2-70b-chat-hf"  # Or any compatible model
