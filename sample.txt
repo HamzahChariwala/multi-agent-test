@@ -1,0 +1,1342 @@
+Work forks from Task 1.1, see doc for contextual information
+Created repo for incoming work @ https://github.com/HamzahChariwala/trace-translator
+
+Currently suspect that formats expected by Chakra are achieved via:
+Torch.profiler – API Reference (https://docs.pytorch.org/docs/2.9/profiler.html)
+class torch.profiler._KinetoProfile(*, activities=None, record_shapes=False, profile_memory=False, with_stack=False, with_flops=False, with_modules=False, experimental_config=None, execution_trace_observer=None, acc_events=False, custom_trace_id_callback=None)
+activities (iterable) – list of activity groups (CPU, CUDA) to use in profiling, supported values:torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,torch.profiler.ProfilerActivity.XPU. Default value: ProfilerActivity.CPU and (when available) ProfilerActivity.CUDA or (when available) ProfilerActivity.XPU.
+record_shapes (bool) – save information about operator’s input shapes.
+profile_memory (bool) – track tensor memory allocation/deallocation (see export_memory_timeline for more details).
+with_stack (bool) – record source information (file and line number) for the ops.
+with_flops (bool) – use formula to estimate the FLOPS of specific operators (matrix multiplication and 2D convolution).
+with_modules (bool) – record module hierarchy (including function names) corresponding to the callstack of the op. e.g. If module A’s forward call’s module B’s forward which contains an aten::add op, then aten::add’s module hierarchy is A.B Note that this support exist, at the moment, only for TorchScript models and not eager mode models.
+experimental_config (_ExperimentalConfig) – A set of experimental options used by profiler libraries like Kineto. Note, backward compatibility is not guaranteed.
+execution_trace_observer (ExecutionTraceObserver) – A PyTorch Execution Trace Observer object.PyTorch Execution Traces offer a graph based representation of AI/ML workloads and enable replay benchmarks, simulators, and emulators. When this argument is included the observer start() and stop() will be called for the same time window as PyTorch profiler.
+acc_events (bool) – Enable the accumulation of FunctionEvents across multiple profiling cycles
+
+Finding: Kineto trace doesn’t support MPS (Apple)
+class torch.profiler.ProfilerActivity Members: CPU, XPU, MTIA, CUDA, HPU, PrivateUse1
+
+Therefore, either have to run on supported hardware e.g. Nvidia GPUs, or just utilise the CPU trace → for now will investigate CPU trace alone
+
+
+Immediate Questions [A]:
+What is the current expected pipeline, where should we intervene?
+What profiling specifically is needed, through what code?
+Can that profiling be attached to pre-trained open source models?
+What do these graphs/traces/timeline currently look like?
+Will the profiling capture dependencies even when parent and child nodes are co-located? If not, where can we collect that metadata?
+
+
+14/11/25
+CPU-only exploration of profiling and trace metadata
+
+[Question A1]
+Current Pipeline Understanding:
+Script –> Kineto trace –> Host trace –> Merged host & device json –> Chakra trace
+		|__________________________________|
+
+Seems like the pipeline above is on a per-device basis. In other words, we get the Kineto trace for each GPU, and so we also need to look into how dependencies between traces are captured in the traces.
+
+[Question A2 & A3]
+Used the following code for profiling:
+
+with torch.profiler.profile(
+   activities=[torch.profiler.ProfilerActivity.CPU],
+   schedule=torch.profiler.schedule(
+       wait=WAIT_STEPS,
+       warmup=WARMUP_STEPS,
+       active=ACTIVE_STEPS,
+       repeat=1
+   ),
+   on_trace_ready=torch.profiler.tensorboard_trace_handler(OUTPUT_DIR),
+   record_shapes=True,
+   profile_memory=True,
+   with_stack=True,
+) as prof:
+   for _ in range(TOTAL_ITERATIONS):
+       with torch.no_grad():
+           model(**inputs)
+       prof.step()
+
+Output trace was a VERY long dictionary containing entries like the following:
+
+
+ {
+   "ph": "X", "cat": "cpu_op", "name": "aten::scaled_dot_product_attention", "pid": 86282, "tid": 2540590,
+   "ts": 3834143696613.617, "dur": 1291.577,
+   "args": {
+     "External id": 219,"Concrete Inputs": ["", "", "", "", "0.", "True", "0.125", "True"], "Record function id": 0, "Input type": ["float", "float", "float", "", "Scalar", "Scalar", "Scalar", "Scalar"], "Input Strides": [[26624, 64, 2048, 1], [3328, 832, 64, 1], [3328, 832, 64, 1], [], [], [], [], []], "Input Dims": [[1, 32, 13, 64], [1, 4, 13, 64], [1, 4, 13, 64], [], [], [], [], []], "Ev Idx": 218
+   }
+ },
+
+Example shown was done on an imported open-source LLM, answering A3
+
+
+17/11/25
+
+Identified that the traces output from above are the Kineto trace, need CPU trace:
+
+tensorboard_trace_handler 		# seems to generate Kineto (device trace)
+ExecutionTraceObserver		# perhaps the way to get the ‘host’ trace
+
+By adding in the `ExecutionTraceObserver`, we add the following to the script:
+
+# Create ExecutionTraceObserver to generate Chakra ET format
+# Start it manually before profiling
+et_observer = ExecutionTraceObserver()
+et_observer.register_callback(CHAKRA_ET_OUTPUT + ".json")
+et_observer.start()
+
+
+# Profile - the ExecutionTraceObserver runs in parallel
+# SAME CODE AS ABOVE
+
+
+# Stop the ExecutionTraceObserver
+et_observer.stop()
+et_observer.unregister_callback()
+ 
+By doing this we still get the same trace as before, in addition to a new one that looks instead like this:
+
+       "id": 277, "name": "aten::scaled_dot_product_attention", "ctrl_deps": 3,
+       "inputs": {"values": [[230,42,0,26624,4,"cpu"],[217,48,0,3328,4,"cpu"],[257,49,0,3328,4,"cpu"],"<None>",0.000000,true,0.125000,true], "shapes": [[1,32,13,64],[1,4,13,64],[1,4,13,64],[],[],[],[],[]], "types": ["Tensor(float)","Tensor(float)","Tensor(float)","None","Double","Bool","Double","Bool"], "strides": [[26624,64,2048,1],[3328,832,64,1],[3328,832,64,1],[],[],[],[],[]]},
+       "outputs": {"values": [[281,50,0,26624,4,"cpu"]], "shapes": [[1,32,13,64]], "types": ["Tensor(float)"], "strides": [[26624,64,2048,1]]},
+       "attrs": [{"name": "rf_id", "type": "uint64", "value": 202},{"name": "fw_parent", "type": "uint64", "value": 0},{"name": "seq_id", "type": "int64", "value": -1},{"name": "scope", "type": "uint64", "value": 0},{"name": "tid", "type": "uint64", "value": 1},{"name": "fw_tid", "type": "uint64", "value": 0},{"name": "op_schema", "type": "string", "value": "aten::scaled_dot_product_attention(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0., bool is_causal=False, *, float? scale=None, bool enable_gqa=False) -> Tensor"},{"name": "kernel_backend", "type": "string", "value": ""},{"name": "kernel_file", "type": "string", "value": ""},{"name": "tensor_range", "type": "string", "value": ""}]
+
+
+
+20/11/25
+
+We now have two different traces outputting, via the two pieces of profiling code. Attempting to merge them, using:
+
+
+chakra_trace_link --rank 0 \
+   --chakra-host-trace chakra_et.json \
+   --chakra-device-trace Hamzahs-MacBook-Pro-2.local_9148.1763400799353537000.pt.trace.json \
+   --output-file output_test
+
+We get a `KeyError: ‘cuda_runtime’` error. This is because the `chakra_trace_link` function expects the Kineto trace to be a GPU trace, seemingly specifically an Nvidia GPU. Seems to be that `chakra_trace_link` calls Critical Path Analysis from the `HolisticTraceAnalysis`, shown with these import statements:
+
+from hta.analyzers.critical_path_analysis import CPEdgeType
+from hta.trace_analysis import TraceAnalysis
+
+The critical path analysis seems to be to identify launch kernels, find synchronisaton points and use them to build dependencies. Hence, a lack of CUDA operation categories e.g. `cuda_runtime`, `kernel`, `gpu_memory` causes the script to fail.
+
+LIMITATION: To properly assess, we will need to run on Nvidia GPUs
+
+For now, we will test what can be achieved with only CPU traces. Using the `chakra_converter` we test on the Kineto and CPU trace:
+
+chakra_converter PyTorch \
+   --input ./example_trace.json \
+   --output ./chakra_trace.et
+
+^ Untested yet whether we have to manually add the rank (GPU ID) into filename manually if not using the `chakra_trace_link` function first.
+
+The function fails on the Kineto trace due to `KeyError: ‘schema’`, but succeeds on the CPU trace. Json-ising the resultant CPU trace we get the correct looking format, albeit with far more metadata than is needed. Two crucial observations:
+Unlike previous traces, this has `ctrlDeps` not just `dataDeps` – what are the benefits of using these control dependencies?
+The trace misses any execution data necessary to simulate e.g. execution times, FLOPs estimate, although does contain shape data which (combined with knowledge of precision) could be used for memory estimates
+
+N.B. ‘Json-ising’ an `.et` file is done with the `chakra_jsonizer` function
+
+Testing on single GPU (T4):
+Quick instructions for setting up cloud instance: 251124_CloudGuidance
+With the new traces, chakra_trace_link worked
+Converted trace ran in astra-sim (had to duplicate as astra-sim expects num_NPUs>1), number of CPU_ops and GPU_comp nodes seems to match trace
+Small issue due to the duplication – operations summary csv only tracks one NPUs activity since IDs aren’t unique, not really an issue for us
+Question: does the CUDA profiling work for AMD too?
+
+
+21/11/25
+Testing on multiple GPUs (4xT4s):
+New file –> `profile_llm_parallel.py`, using HuggingFace auto mapping function to distribute model over underlying hardware
+Contrasting expectations, data for all 4 GPUs logged to the same Kineto trace
+Operation in the trace still have an index to associate to a device
+Also changed model setup from repeat forward passes to token generation
+`chakra_trace_link` on resulting traces (v1) threw errors and exited:
+[2025-11-24 16:48:23,596] trace_parser.py:107 [WARNING]: Parsed /Users/hamzahchariwala/Desktop/GitHub/param/multi-T4-setup_1907.1763743550346206395.pt.trace.json time = 0.29 seconds 
+[2025-11-24 16:48:23,658] trace_parser.py:317 [WARNING]: Rounding down ns resolution events due to issue with events overlapping. ts dtype = float64, dur dtype = float64.Please see https://github.com/pytorch/pytorch/pull/122425
+[2025-11-24 16:48:23,829] trace_parser.py:430 [WARNING]: Parsed /Users/hamzahchariwala/Desktop/GitHub/param/multi-T4-setup_1907.1763743550346206395.pt.trace.json backend=json in 0.52 seconds; current PID:53319
+[2025-11-24 16:48:23,876] trace.py:236 [WARNING]: Overall parsing of /Users/hamzahchariwala/Desktop/GitHub/param/multi-T4-setup_1907.1763743550346206395.pt.trace.json in 0.57 seconds; current PID:53319
+[2025-11-24 16:48:23,891] trace.py:449 [WARNING]: leaving parse_multiple_ranks duration=0.58 seconds
+[2025-11-24 16:48:23,891] trace.py:483 [WARNING]: leaving parse_traces duration=0.59 seconds
+[2025-11-24 16:48:23,891] trace.py:647 [WARNING]: ProfilerStep not found in the trace. The analysis result may not be accurate.
+[2025-11-24 16:48:23,895] critical_path_analysis.py:1467 [WARNING]: Trace does not contain CUDA Synchronization events so the results of analysis could be inaccurate.
+[2025-11-24 16:48:23,895] critical_path_analysis.py:1471 [WARNING]: Please see this PR to learn how to enable CUDA sync events https://github.com/pytorch/pytorch/pull/105187
+[2025-11-24 16:48:23,895] critical_path_analysis.py:1480 [ERROR]: Could not find annotation ProfilerStep in the trace.
+Added the following code to address cuda_sync_events:
+125 [+] with_flops=True,
+126 [+] experimental_config=torch._C._profiler._ExperimentalConfig(
+127 [+]     verbose=True, 
+128 [+]     enable_cuda_sync_events=True)
+Seemingly eliminated that specific problem in next set of traces (v2)
+
+Remaining Issues:
+Given all GPU trace data is logging to a single file, we would expect that the `chakra_trace_link` function would use the argument `--rank` to split them out. This didn’t happen, there are a few (not mutually exclusive) explanations:
+[Scenario A] When running the code, many warnings/errors threw. Possible that some of these warnings are the reason ops aren’t being split
+[Scenario B] We should actually expect multiple traces, one for each NPU, and perhaps the way we do the parallelism prevents this
+[Scenario C] There remains an error in the profiling code itself
+[Scenario D] The `--rank` argument means something different than which NPU we’re trying to extract data for, another knob controls this
+These are the obvious cases, and exclude the other apparent one of ‘this feature is not correctly implemented’/’additional implementation needed’ since this should be the most unlikely. 
+The issue of the traces not splitting correctly, or our understanding of what should be happening being wrong was verified by three things:
+Extensive [WARNING] and [ERROR] messages in the terminal
+The function allowed for rank > GPU_num, which we expect to throw errors
+Creating the four traces and simulating in astra-sim, we see from the timelines that every GPU executed the exact same workload
+
+Console output from `chakra_trace_link`:
+
+[2025-11-24 17:16:03,478] trace.py:474 [INFO]: ranks=[3]
+[2025-11-24 17:16:03,821] trace_parser.py:107 [WARNING]: Parsed /Users/hamzahchariwala/Desktop/GitHub/param/multi-T4-setup_1978.1764003625984087136.pt.trace.json time = 0.34 seconds 
+[2025-11-24 17:16:03,876] trace_parser.py:317 [WARNING]: Rounding down ns resolution events due to issue with events overlapping. ts dtype = float64, dur dtype = float64.Please see https://github.com/pytorch/pytorch/pull/122425
+[2025-11-24 17:16:04,060] trace_parser.py:430 [WARNING]: Parsed /Users/hamzahchariwala/Desktop/GitHub/param/multi-T4-setup_1978.1764003625984087136.pt.trace.json backend=json in 0.58 seconds; current PID:57923
+[2025-11-24 17:16:04,171] trace.py:236 [WARNING]: Overall parsing of /Users/hamzahchariwala/Desktop/GitHub/param/multi-T4-setup_1978.1764003625984087136.pt.trace.json in 0.69 seconds; current PID:57923
+[2025-11-24 17:16:04,186] trace.py:449 [WARNING]: leaving parse_multiple_ranks duration=0.71 seconds
+[2025-11-24 17:16:04,186] trace.py:483 [WARNING]: leaving parse_traces duration=0.71 seconds
+[2025-11-24 17:16:04,186] trace.py:651 [WARNING]: There is only one iteration in the trace. The analysis result may not be accurate.
+[2025-11-24 17:16:04,190] critical_path_analysis.py:1493 [INFO]: Looking up events under [0, 0) instance(s) of 'ProfilerStep' annotation.
+[2025-11-24 17:16:04,191] critical_path_analysis.py:1509 [INFO]: Looking up events within the window (3741, 389511.0)
+[2025-11-24 17:16:04,206] critical_path_analysis.py:1533 [INFO]: Clipped dataframe has 22811 events
+[2025-11-24 17:16:04,208] critical_path_analysis.py:1540 [INFO]: Preprocessing took 0.02 seconds
+
+/Users/hamzahchariwala/anaconda3/envs/chakra_dev/lib/python3.10/site-packages/hta/analyzers/critical_path_analysis.py:727: FutureWarning: A value is trying to be set on a copy of a DataFrame or Series through chained assignment using an inplace method.
+The behavior will change in pandas 3.0. This inplace method will never work because the intermediate object on which we are setting values always behaves as a copy.
+
+For example, when doing 'df[col].method(value, inplace=True)', try using 'df.method({col: value}, inplace=True)' or df[col] = df[col].method(value) instead, to perform the operation inplace on the original object.
+
+...
+
+  cuda_stream_wait_events.index_next_launch.fillna(-1, inplace=True)
+[2025-11-24 17:16:05,177] critical_path_analysis.py:1082 [WARNING]: No edge was added - queue length is 5!= 1 but no last kernel on stream 19, current kernel: name = Memcpy HtoD (Device -> Device), correlation = 7417
+[2025-11-24 17:16:05,231] critical_path_analysis.py:1082 [WARNING]: No edge was added - queue length is 5!= 1 but no last kernel on stream 29, current kernel: name = Memcpy HtoD (Device -> Device), correlation = 18611
+[2025-11-24 17:16:05,440] critical_path_analysis.py:1544 [INFO]: CPGraph construction took 1.23 seconds
+[2025-11-24 17:16:05,453] critical_path_analysis.py:1171 [WARNING]: Ignoring negative weight of -1 for CPEdge(begin=24232, end=24233, weight=np.float64(-1.0), type=<CPEdgeType.OPERATOR_KERNEL: 'critical_path_operator'>)
+[2025-11-24 17:16:05,453] critical_path_analysis.py:1175 [ERROR]: Found an edge with negative weight CPEdge(begin=24327, end=24328, weight=np.float64(-11.0), type=<CPEdgeType.KERNEL_KERNEL_DELAY: 'critical_path_kernel_kernel_delay'>)
+[2025-11-24 17:16:05,453] critical_path_analysis.py:1155 [ERROR]:  Source node idx 38430,  node name = Memcpy HtoD (Device -> Device)
+[2025-11-24 17:16:05,453] critical_path_analysis.py:1159 [ERROR]:  Dest node idx 38430,  node name = Memcpy HtoD (Device -> Device)
+[2025-11-24 17:16:05,453] critical_path_analysis.py:1175 [ERROR]: Found an edge with negative weight CPEdge(begin=24331, end=24332, weight=np.float64(-2.0), type=<CPEdgeType.KERNEL_KERNEL_DELAY: 'critical_path_kernel_kernel_delay'>)
+
+...
+
+[2025-11-24 17:16:05,461] critical_path_analysis.py:1175 [ERROR]: Found an edge with negative weight CPEdge(begin=28943, end=28944, weight=np.float64(-6.0), type=<CPEdgeType.KERNEL_KERNEL_DELAY: 'critical_path_kernel_kernel_delay'>)
+[2025-11-24 17:16:05,461] critical_path_analysis.py:1155 [ERROR]:  Source node idx 49608,  node name = Memcpy HtoD (Device -> Device)
+[2025-11-24 17:16:05,461] critical_path_analysis.py:1159 [ERROR]:  Dest node idx 49608,  node name = Memcpy HtoD (Device -> Device)
+[2025-11-24 17:16:05,461] critical_path_analysis.py:1192 [ERROR]: Negative weights means before-after relationships are not valid
+[2025-11-24 17:16:05,461] trace_linker.py:130 [ERROR]: Critical path analysis encountered an invalid graph structure: Graph is not valid, see prints above for help on debugging
+[2025-11-24 17:16:05,462] trace_linker.py:286 [INFO]: Enforcing sync order in Kineto traces.
+[2025-11-24 17:16:05,462] trace_linker.py:332 [INFO]: Thread PyTorch Profiler: Identifying synchronization dependency.
+[2025-11-24 17:16:05,462] trace_linker.py:332 [INFO]: Thread 0: Identifying synchronization dependency.
+
+...
+
+[2025-11-24 17:16:06,792] trace_link.py:49 [INFO]: Linking process successful. Output file is available at multiT4.3.json.
+
+
+27/11/25
+Hypothesis 1: Scenario B + C + D
+My intuition says that Scenario A is not the fundamental issue. Fundamentally I think we should be expecting multiple device traces from the profiling and I presume the reason we’re not is because of an error in the profiling code. If true, then it would also mean that the `--rank` argument doesn’t control which NPU to extract data for.
+
+Hypothesis 1A: PyTorch Profiler operates on ‘processes’, not devices
+Hypothesis 1B: The parallelism method determines the number of ‘processes’
+Hypothesis 1C: Trace output methods aggregate the traces into one
+Hypothesis 1D: Separate profiler instances needed per-device
+Hypothesis 1E: We can easily process the trace into multiple device traces
+
+Not actually sure what the distinguishing feature of a ‘process’ would be and so challenging to design tests. 1A and 1B become interesting targets if we assume our current `device_map=”auto”` to be the distribution of a single process over multiple devices rather than multiple processes. 
+
+
+28/11/25
+Investigation 1: Process and Thread IDs
+`”pid”` field in Kineto traces is identical for almost every single entry
+Different process and thread IDs (PIDs and TIDs) only towards end of trace, and for particular operations, approximate breakdown here:
+
+
+Operation
+Category
+Operation Count
+PID 1978
+PID 0
+PID 1
+PID 2
+PID 3
+Total
+user_annotation
+2
+
+
+
+
+
+
+
+
+2
+cpu_op
+9498
+
+
+
+
+
+
+
+
+9498
+cpu_instant_event
+4495
+
+
+
+
+
+
+
+
+4495
+python_function
+24176
+
+
+
+
+
+
+
+
+24176
+gpu_memcpy
+
+
+88
+38
+38
+68
+232
+ac2g
+3383
+672
+656
+656
+607
+5974
+cuda_runtime
+3159
+
+
+
+
+
+
+
+
+3159
+cuda_sync
+
+
+77
+33
+33
+66
+209
+kernel
+
+
+493
+459
+567
+567
+2086
+cuda_driver
+224
+
+
+
+
+
+
+
+
+224
+gpu_memset
+
+
+14
+18
+18
+14
+64
+gpu_user_annotation
+
+
+2
+2
+2
+2
+8
+
+
+
+
+
+
+
+
+
+
+`1978` seems to be the CPU process (and thread) ID. However the other PIDs seem to just be the index of the GPUs. This would suggest that whether just for grouping or because of the actual was processes are managed, we are differentiating between different GPU’s work. This begs the question, if we are correctly indexing where work occurred, is this how the traces are meant to be?
+Unfortunately this doesn’t falsify hypothesis 1A because we don’t know whether the ‘workload’ is still considered to be a single process with child processes and/or where the labels of the process and simply overwritten for simplicity. 
+
+
+
+Investigation 2: GPU vs CPU Work
+From the previous investigation, we can segment GPU vs CPU operations by the PID. While this investigation is not crucial for understanding the validity of hypothesis 1, it will be useful for future work
+Some aspects of the trace do not reflect ‘real work’ (emboldened) done by the GPU or CPU, a brief (rough) description of each category is provided below:
+`cpu_op` – CPU tensor operations  e.g. tensor reshaping, type casting, small math ops, and some dispatcher functions
+`cuda_runtime` – CUDA runtime API calls from CPU to launch/manage GPU
+`cuda_driver` – low-level (below runtime^) CUDA driver API calls
+`kernel` – GPU kernel executions e.g. matmul, elementwise, reduce kernels
+`gpu_memcpy` – Memory transfers on/between GPUs, device-to-device copies?
+`gpu_memset` – GPU memory initialisation e.g. zeroing buffers
+`cuda_sync` – GPU synchronisation events, overhead for parallel compute
+`python_function` – parent events, contain all encapsulated work
+`cpu_instant_event` – tracking memory usage (allocation/deallocation)
+`ac2g` – links GPU-side kernel execution to CPU-side CUDA API call
+`user_annotation` & `gpu_user_attention` – user-inserted profiler markers
+
+
+
+
+
+
+Further investigation on specific operations within these categories, their average duration, scalability, etc, will be reserved for later work/benchmarking.
+
+
+
+
+
+01/12/25
+Investigation 3: Alternative Parallelism
+Two types of ‘alternative parallelism’:
+Different frameworks – HuggingFace’s functions may implement model parallelism in a way that specifically results in one device trace
+Different strategies – It may be that model/pipeline parallelism itself is the issue since, for a single pass, only one GPU is active at a time
+Best strategy to isolate how each affects trace generation would be to test multiple frameworks across a range of parallelism techniques
+Candidate frameworks: PyTorch Native, DeepSpeed, MegatronLM
+Seems that MegatronLM has some disadvantages for a quick test:
+Some model code rewriting necessary
+Checkpoint conversion issues???
+Limited official support (GPT, BERT, T5, some LLaMA) 
+Parallelism decided before loading the model?
+More complex launching and debugging?
+MegatronLM seems to be more specifically designed for training from scratch, perhaps not well-suited to this test
+Not all parallelism strategies have communications in the forward pass (which is all we care about in the inference case)  and we would like to observe communications to ensure they are correctly preserved in the Chakra traces (and therefore also astra-sim) so we restrict ourselves to those that do for this testing, some of which are enumerated below:
+PyTorch: FSDP (sharded-data), TP (tensor), PiPPy (pipeline)
+DeepSpeed: ZeRO-3 (other strategies only have comms for backward pass?)
+Run into many issues with the tested strategies, for example:
+Requiring memory buffer for optimiser states even if using for inference
+Loading entire model onto CPU and temporarily requiring enough storage on the GPU to load the whole model? Not clear why/if this is a bug
+Manually moving embedding layers and outputs? Not clear if bug
+Errors due to mismatch in expected labels for layers, not label agnostic?
+^Some of the eros may be because the tooling for a couple of the techniques is still nascent and being developed
+
+
+02/12/25
+Investigation 3 cont. [Alternative Parallelism]
+N.B. even for smaller models and a single token generation being profiled, host traces are in the 10s of MBs and device traces are in the 100s, approaching GBs. May be necessary to think about how traces are initially generated and/or collected to improve user experience and ease of collection
+Starting with tensor parallelism traces since we expect interesting communication patterns that should be able to falsified by inspection
+Using `chakra_trace_link` led to same error messages as previously mentioned, run on all traces using their respective CPU trace, and different `rank` params
+In printed info from linking function, NPUs showed different event counts suggesting asymmetry present: [0: 62557, 1: 62374, 2: 63221, 3: 62715]
+Running resulting traces (after `chakra_converter PyTorch`):
+
+[2025-12-02 13:00:40.643] [workload] [info] NPU 0 initiating workload: starting execution
+[2025-12-02 13:00:40.645] [workload] [info] NPU 1 initiating workload: starting execution
+[2025-12-02 13:00:40.645] [workload] [info] NPU 2 initiating workload: starting execution
+[2025-12-02 13:00:40.645] [workload] [info] NPU 3 initiating workload: starting execution
+[2025-12-02 13:00:40.645] [simulation] [info] Starting event loop: heterogeneous_mode=false
+[2025-12-02 13:00:40.651] [workload] [critical] For rank 1 ET node 569, communicator group 0 not found
+
+Keeping `rank` static during linking didn’t change the results
+Issue was missing config file `comm_group.json`: {“0”:[0,1,2,3]}
+“0” in config json matches the pg_name parameter in the PyTorch traces
+Argument added to `congestion-unaware-log.sh` to pass file to astra-sim
+New error messaged emerged (when running sim):
+
+AstraSim_Analytical_Congestion_Unaware: /workspace/astra-sim/astra-sim/system/CommunicatorGroup.cc:32: 
+void AstraSim::CommunicatorGroup::set_id(int): Assertion `id > 0' failed.
+
+Astra-sim expects any communicator group id to be >0
+Mismatch in the expected group id and `pg_name` leads to error
+
+_____________________________________________________________________________
+│                                                                          │
+│       PyTorch profiling              (Executor-specific profiling)       │
+│              |__________________________________|                        │
+│                                  |                                       │
+│                      EXECUTOR ––arg=n script.py                          │
+│                   _______________|__________________                     │
+│                  |                                  |                    │
+│       host_trace.json + [...]           device_trace.json + [...]        │
+│                  |__________________________________|                    │
+│                                  |                                       │
+│                          chakra_trace_link                               │
+│                                  |                                       │
+│                      linked_trace.0.json + [...]                         │
+│                                  |                                       │
+│                          chakra_converter         comm_group.json        │
+│                                  |                       |               │
+│                       linked_trace.0.et + [...]          |               │
+│                                  |_______________________|               │
+│                                  |                                       │
+│                 astra-sim (./congestion-unaware-log.sh)                  │
+│                                                                          │
+|___________________________________________________________________________|
+
+Therefore, we need to implement a fix. Most apparent options:
+During one of the trace conversion stages, simply add 1 to any instance of `pg_name`, would work but place to implement isn’t obvious and may be difficult to track which index is supposed to be used where
+Writing out/ignoring the `pg_name` and using default global collectives, limits utility when we have multiple communication groups in the future
+Edit relevant astra-sim code (in `CommunicatorGroup.cc`):
+
+void CommunicatorGroup::set_id(int id) {
+   assert(id > 0);
+   this->id = id;
+   this->num_streams = id * 1000000;
+
+Code is used to set `stream_id`, tag for send/recv operations
+Each stream seems to represent a chunk of a given collective
+Implementation segments `stream_id` values by communicator groups
+Changing astra-sim code seems to be most minimal change
+Shouldn’t disrupt downstream function, has the same limitation as before where astra-sim can only represent 1,000,000 global collective chunks before shifting into reserved values
+
+void CommunicatorGroup::set_id(int id) {
+   assert(id >= 0);
+   this->id = id;
+   // Offset by 1, avoids collision with global Sys::num_streams
+   this->num_streams = (id + 1) * 1000000;
+
+Any 'std::invalid_argument' error seen after these changes are likely due to keys in `comm_group.json` that can’t be cast to integers
+Testing changes w/ ./congestion-unaware-log.sh --npu-performance --config analytical_test --run-name TP-test
+
+[2025-12-02 14:50:54.402] [workload] [info] sys[2] finished, 399073000 cycles, exposed communication 389741000 cycles.
+[2025-12-02 14:50:54.402] [workload] [info] sys[2] hardware: CPU_ops=7535, GPU_ops=1232, GPU_comms=64, CPU_cycles=399072000, GPU_cycles=9332000, Comm_cycles=591616
+[2025-12-02 14:50:54.402] [workload] [info] sys[1] finished, 406458000 cycles, exposed communication 392977000 cycles.
+[2025-12-02 14:50:54.402] [workload] [info] sys[1] hardware: CPU_ops=7535, GPU_ops=1232, GPU_comms=64, CPU_cycles=406457000, GPU_cycles=13481000, Comm_cycles=314320708
+[2025-12-02 14:50:54.402] [workload] [info] sys[0] finished, 406762000 cycles, exposed communication 392947000 cycles.
+[2025-12-02 14:50:54.402] [workload] [info] sys[0] hardware: CPU_ops=7535, GPU_ops=1232, GPU_comms=64, CPU_cycles=406761000, GPU_cycles=13815000, Comm_cycles=315613708
+[2025-12-02 14:50:54.402] [workload] [info] sys[3] finished, 409465000 cycles, exposed communication 397248000 cycles.
+[2025-12-02 14:50:54.402] [workload] [info] sys[3] hardware: CPU_ops=7535, GPU_ops=1232, GPU_comms=64, CPU_cycles=409464000, GPU_cycles=12217000, Comm_cycles=307176708
+
+Difference in final execution times suggests that there is asymmetry in what executed, however, the number of ops and comms being constant across all four NPUs suggests they may be running identical workloads
+The initial test for trace correctness was generating timeline visualisations. Due to very high number of operations, charts are too crowded to verify correctness, series of options available for further investigation including: 
+A: Look through tensor sizing in operations across NPUs
+B: Check appearance of model module names in original traces
+C: Create dictionary of all operation names by category, remove certain categories until timeline allows us to visualise something useful
+D: Regex-esque approach to find specific text diffs between trace jsons
+E: Json-ise traces, look for expected SEND/RECV nodes, check correctness
+
+
+10/12/25
+Investigation 3 cont. [Alternative Parallelism]
+Beginning with approach A, looking at the tensor sizings
+Plots below explore the occurrence of tensor calculation kernels:
+
+
+
+
+The dimension 14 in the kernels is presumably due to the token length during this pass. However the appearance of 8 in the 1x14x8x80 could suggest that we have correctly sharded the model (32 heads split 4 ways = 8 heads per NPU)
+This still needs to be verified via other methods, however the other emergent pressing issue is the synchronisation of GPU2. We would expect that parts of the computation on the other GPUs would rely on collecting results from GPU2, and yet the other 3 GPUs finish execution comfortably before GPU2
+Sub-investigation: was extra computation placed on GPU2 that uses global results (from other GPUs) to finish the forward pass? (NO)
+Plot below tests possible asymmetry in operations, see that for actually tensor operations, the number executed is identical
+Included only obvious operation classes that show asymmetry: (a) [SYNC] Event Sync, (b) [RT] cudaEventQuery, (c) [RT] cudaThreadExchangeStreamCaptureMode – expected behaviour?
+
+
+[CPU = cpu_op, KRN = kernel, RT = cuda_runtime, SYNC = cuda_sync, MEM = gpu_memcpy]
+
+Sub-investigation: we can see from the previous plot that the kernels reporting the dimension 8 as a cpu_op
+This appears to actually be a dispatcher function, whose duration would include: kernel launch overhead, CPU-side setup, synchronisation, and the actual kernel execution
+N.B. Filtering out these dispatcher functions would likely alter the earlier plots comparing CPU and GPU operations
+Seems to launch a GPU kernel with the following name: fmha_cutlass_f16_aligned_32x128_rf_sm75
+32x128 = 32 query tokens x 128 key tokens, only using 14x14
+Q [14,80] @ K^T [80,14] = Scores [14,14]
+1x14x8x80 (BSHD) –> grid launch [1,8,1] –> tile config [32,128]?
+^Assumed operation order, need to investigate how these operations run, does one of the kernels get called for each head? In other words does 1 efficient attention cpu op contain 8 CUDA kernels?
+To investigate, we generate the plot shown on the next page, mapping which low-level operations occurred between two calls of the efficient attention dispatcher functions:
+
+
+
+
+
+
+15/12/25
+Investigation 3 cont. [Alternative Parallelism]:
+We can see that the counts for elementwise, gemm, and attention operation counts are identical between all calls tested except the first. This raises three natural questions: why is the first call different? Secondly, why do we only see 1 attention kernel when we’re expecting 8 (one for each head)? Finally, we can clearly see that the profiling for GPU 2 is erroneous.
+
+
+
+Why only one kernel: looking over instances of fmha_cutlassF... kernels in the GPU traces, the metadata includes the following:
+“grid”: [1, 8, 1]
+“block”: [32, 4, 1]
+“est. achieved occupancy %”: 3
+Seems that a single kernel controls all 8 heads, makes sense for kernel launch overhead minimisation
+FYI: threads –> warps –> blocks –> grids
+def:   [SW]     [HW]      [SW]     [SW]
+Threads – smallest unit of execution, have their own private registers, and are executed as part of a warp
+Warps – collections of 32 threads within a block, where all threads in a warp execute the same program concurrently (Single-Instruction Multiple-Threads)
+Blocks – groups of threads executing together on the same SM (streaming multiprocessor), able to sync with each other, and sharing fast memory. Multiple blocks can reside on a single SM simultaneously
+Grids – collections of independent blocks, across different SMs, unable to synchronise between blocks within a single kernel launch
+SMs – fundamental processing units that execute blocks, each containing many SIMD execution lanes (CUDA/equivalent cores), a large register file, some shared memory (SRAM, often unified with L1 cache), warp schedulers, load/store units, etc
+Cores – SIMD execution lanes inside an SM that perform arithmetic and logic operations. They don’t own threads, instructions issued for a warp are executed in parallel across many cores, with threads being dynamically mapped onto available cores. Cores don’t hold state, and cannot synchronise
+GPUs: threads –> warps –> blocks –> grids
+TPUs: operations –> tiles –> systolic arrays?
+CPUs: instructions –> threads –> cores –> sockets?
+Launch geometry factors and the resulting occupancy factor into kernel optimisation but are not the sole – or even biggest – constraint (depends on bottleneck e.g. latency, memory, compute, occupancy). Optimising memory behaviour and algorithm/instruction efficiency are crucial.
+Erroneous profiling on GPU 2: POSTPONED, investigate later
+Why is the first call different: POSTPONED, investigate later
+
+
+17/12/25
+Investigation 3 cont. [Alternative Parallelism]:
+The core issue remains the correctness of the traces; we have verified that the tensor splits seem to be correct but are left questioning the timeline of operations, which seem to be erroneous – particularly for GPU2.
+Q1. What is the expected order of operations?
+Legend
+B = batch_size, S = sequence_length, H = hidden_dimension, N = num_attention_heads, D = head_dimension (H / N), F = ffn_intermediate_size, W = world_size (number of GPUs)
+Operation Flow
+
+INPUT: [B, S, H] - Full tensor replicated on all GPUs
+│
+├─────────────────────────────────────┐
+│                    ATTENTION BLOCK                           │
+├─────────────────────────────────────┤
+│
+├─> Q_proj (ColwiseParallel)
+│   Input:  [B, S, H]    (full tensor)
+│   Weight: [H, H/W]     (each GPU has H/W columns)
+│   Output: [B, S, H/W]  (partial - each GPU has different heads)
+│
+├─> K_proj (ColwiseParallel)  
+│   Input:  [B, S, H]    (full tensor)
+│   Weight: [H, H/W]     (each GPU has H/W columns)
+│   Output: [B, S, H/W]  (partial - each GPU has different heads)
+│
+├─> V_proj (ColwiseParallel)
+│   Input:  [B, S, H]    (full tensor)
+│   Weight: [H, H/W]     (each GPU has H/W columns)
+│   Output: [B, S, H/W]  (partial - each GPU has different heads)
+│
+├─> Reshape to [B, S, N/W, D] on each GPU
+│
+├─> Scaled Dot-Product Attention (independent per GPU)
+│   Q: [B, N/W, S, D]
+│   K: [B, N/W, S, D]  
+│   V: [B, N/W, S, D]
+│   Output: [B, N/W, S, D] → reshape to [B, S, H/W]
+│
+├─> O_proj (RowwiseParallel)
+│   Input:  [B, S, H/W]  (partial - different on each GPU)
+│   Weight: [H/W, H]     (each GPU has H/W rows)
+│   Output: [B, S, H]    (partial - each GPU has 1/W of full result)
+│
+├─> *** ALLREDUCE #1 *** (SUM across GPUs)
+│   Input:  [B, S, H] (partial on each GPU)
+│   Output: [B, S, H] (complete - same on all GPUs)
+│   >>> COMMUNICATION BOTTLENECK <<<
+│
+├─> Residual Connection: [B, S, H] + [B, S, H]
+│
+└─> LayerNorm: [B, S, H]
+    │
+    ├────────────────────────────────────┐
+    │                      MLP BLOCK                             │
+    ├────────────────────────────────────┤
+    │
+    ├─> FC1 (ColwiseParallel)
+    │   Input:  [B, S, H]    (full tensor)
+    │   Weight: [H, F/W]     (each GPU has F/W columns)
+    │   Output: [B, S, F/W]  (partial - each GPU has different features)
+    │
+    ├─> SiLU/GELU Activation (element-wise on partial)
+    │   [B, S, F/W]
+    │
+    ├─> FC2 (RowwiseParallel)
+    │   Input:  [B, S, F/W]  (partial - different on each GPU)
+    │   Weight: [F/W, H]     (each GPU has F/W rows)
+    │   Output: [B, S, H]    (partial - each GPU has 1/W of full result)
+    │
+    ├─> *** ALLREDUCE #2 *** (SUM across GPUs)
+    │   Input:  [B, S, H] (partial on each GPU)
+    │   Output: [B, S, H] (complete - same on all GPUs)
+    │   >>> COMMUNICATION BOTTLENECK <<<
+    │
+    ├─> Residual Connection: [B, S, H] + [B, S, H]
+    │
+    └─> LayerNorm: [B, S, H]
+        │
+        └──> OUTPUT: [B, S, H] - Full tensor replicated on all GPUs
+                     (becomes input to next layer)
+
+Q2. What is the order we actually observe?
+Below is example from GPU1, tracking one layer’s computation
+
+
+By inspection, GEMM and FMSA kernels somewhat match our expectations, need to probe more specifically for correctness
+
+
+
+
+
+As expected, the traces for GPU 2 (8089) are irregular
+N.B. We used the high-level layer labels (PhiDecodeLayer) as a ‘flag’ event for reconstructing the traces, however, we can see even in the early layers (layer 5 shown in all plots), the actual compute kernels are lagging significantly behind the corresponding profiling time for that event being theoretically launched. There are a number of possible causes, for example:
+This may be a scheduling artefact, the high-level window closes when the event is queued not when it has run
+If so, presumably communication is the bottleneck preventing the scheduled operations from starting?
+Profiling-induced errors (seems unlikely that there are multiple out-of-sync clocks tracking different features)
+SHOULD LOOK INTO PROFILING IMPLEMENTATION LATER
+The main challenge with the layer events and the kernels being out of sync means we have to select a different ‘flag’ event for filtering the traces – we’ll nominate one later
+
+
+18/12/25
+Investigation 3 cont. [Alternative Parallelism]:
+Analysis reinforces plot from 15/12, order is consistent
+
+| # | Start (ms) | Duration (ms) | Category | Inferred Purpose | Kernel Name |
+| 01 | 10.009 | 0.002 | Element-wise  | Residual addition (Prev.)     | `void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>>`  |
+| 02 | 10.011 | 0.002 | Element-wise  | Residual addition (Prev.)     | `void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>>`  |
+| 03 | 10.014 | 0.006 | Normalisation | Layer Normalisation           | `void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<c10::Half, float>`     |
+| 04 | 10.021 | 0.018 | GEMM/MatMul   | Linear Projection (Q)         | `void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_t...`        |
+| 05 | 10.039 | 0.019 | GEMM/MatMul   | Linear Projection (K)         | `void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_t...`        |
+| 06 | 10.059 | 0.017 | GEMM/MatMul   | Linear Projection (V)         | `void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_t...`        |
+| 07 | 10.077 | 0.003 | Element-wise  | Scale/Pre-Attention prep      | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 08 | 10.081 | 0.003 | Element-wise  | Scale/Pre-Attention prep      | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 09 | 10.085 | 0.003 | Other         | QKV Tensor Concatenation      | `void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous...`      |
+| 10 | 10.088 | 0.002 | Element-wise  | Softmax component             | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 11 | 10.091 | 0.003 | Element-wise  | Softmax component             | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 12 | 10.095 | 0.002 | Element-wise  | Softmax component             | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 13 | 10.098 | 0.002 | Element-wise  | Softmax component             | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 14 | 10.101 | 0.003 | Other         | QKV Tensor Concatenation      | `void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous...`      |
+| 15 | 10.105 | 0.002 | Element-wise  | Softmax component             | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 16 | 10.107 | 0.003 | Element-wise  | Softmax component             | `void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast...`          |
+| 17 | 10.110 | 0.003 | Other         | QKV Tensor Concatenation      | `void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous...`      |
+| 18 | 10.114 | 0.003 | Other         | QKV Tensor Concatenation      | `void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous...`      |
+| 19 | 10.118 | 0.003 | Other         | QKV Tensor Concatenation      | `void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous...`      |
+| 20 | 10.122 | 0.003 | Other         | QKV Tensor Concatenation      | `void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous...`      |
+| 21 | 10.126 | 0.009 | Attention     | Mem-efficient fused attention | `fmha_cutlassF_f16_aligned_32x128_rf_sm75(PyTorchMemEffAttention::AttentionKernel...`        |
+| 22 | 10.135 | 0.002 | Element-wise  | Scale Output                  | `void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<c10::Half...`   |
+| 23 | 10.137 | 0.018 | GEMM/MatMul   | Linear Projection (O)         | `void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_t...`        |
+| 24 | 10.159 | 0.082 | GEMM/MatMul   | MLP fc1 (Gate)                | `void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_t...`        |
+| 25 | 10.241 | 0.008 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::Half...`   |
+| 26 | 10.249 | 0.013 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)...`     |
+| 27 | 10.263 | 0.012 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::Half...`   |
+| 28 | 10.276 | 0.012 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half...` |
+| 29 | 10.289 | 0.013 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<c10::Half...`   |
+| 30 | 10.302 | 0.012 | Element-wise  | GELU (Tanh activation)        | `void at::native::tanh_kernel_cuda(at::native::at_tanh_wrapper<c10::Half>)`                  |
+| 31 | 10.316 | 0.013 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_...`        |
+| 32 | 10.329 | 0.013 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::Half...`   |
+| 33 | 10.342 | 0.013 | Element-wise  | GELU component                | `void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<c10::Half...`   |
+| 34 | 10.356 | 0.074 | GEMM/MatMul   | MLP fc2 (Up)                  | `void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_t...`        |
+
+Observed order is essentially exactly what we expected, except the residual and layer norm are grouped with the following operation cluster, rather than the one corresponding to that layer – presumably due to being bottlenecked by the collectives
+
+PTO for continuation
+Q3. Do collectives exhibit expected behaviour?
+Observe the collectives-related metadata from the CPU traces:
+
+
+––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+      {
+        "id": 746, "name": "nccl:all_reduce", "ctrl_deps": 745,
+        "inputs": {"values": [[742,100,0,35840,2,"cuda:1"]], "shapes": [[1,14,2560]], "types": ["Tensor(c10::Half)"], "strides": [[35840,2560,1]]},
+        "outputs": {"values": [], "shapes": [], "types": [], "strides": []},
+        "attrs": [{"name": "rf_id", "type": "uint64", "value": 488},{"name": "fw_parent", "type": "uint64", "value": 0},{"name": "seq_id", "type": "int64", "value": -1},{"name": "scope", "type": "uint64", "value": 7},{"name": "tid", "type": "uint64", "value": 1},{"name": "fw_tid", "type": "uint64", "value": 0},{"name": "op_schema", "type": "string", "value": ""},{"name": "kernel_backend", "type": "string", "value": ""},{"name": "kernel_file", "type": "string", "value": ""},{"name": "tensor_range", "type": "string", "value": ""}]
+      },
+      {
+        "id": 745, "name": "record_param_comms", "ctrl_deps": 744,
+        "inputs": {"values": [[[742,100,0,35840,2,"cuda:1"]],[705,false],["0","default_pg"],1,"allreduce",[],[],0,1,4], "shapes": [[[1,14,2560]],[[],[]],[[],[]],[],[],[],[],[],[],[]], "types": ["GenericList[Tensor(c10::Half)]","Tuple[Int,Bool]","Tuple[String,String]","Int","String","GenericList[]","GenericList[]","Int","Int","Int"], "strides": [[[35840,2560,1]],[[],[]],[[],[]],[],[],[],[],[],[],[]]},
+        "outputs": {"values": [[[742,100,0,35840,2,"cuda:1"]]], "shapes": [[[1,14,2560]]], "types": ["GenericList[Tensor(c10::Half)]"], "strides": [[[35840,2560,1]]]},
+        "attrs": [{"name": "rf_id", "type": "uint64", "value": 487},{"name": "fw_parent", "type": "uint64", "value": 0},{"name": "seq_id", "type": "int64", "value": -1},{"name": "scope", "type": "uint64", "value": 0},{"name": "tid", "type": "uint64", "value": 1},{"name": "fw_tid", "type": "uint64", "value": 0},{"name": "op_schema", "type": "string", "value": ""},{"name": "kernel_backend", "type": "string", "value": ""},{"name": "kernel_file", "type": "string", "value": ""},{"name": "tensor_range", "type": "string", "value": ""}, 
+  {"name": "collective_name", "type": "string", "value": "allreduce"}, 
+  {"name": "dtype", "type": "string", "value": "Half"}, 
+  {"name": "in_msg_nelems", "type": "uint64", "value": 35840}, 
+  {"name": "out_msg_nelems", "type": "uint64", "value": 35840}, 
+  {"name": "in_split_size", "type": "string", "value": "[]"}, 
+  {"name": "out_split_size", "type": "string", "value": "[]"}, 
+  {"name": "global_rank_start", "type": "uint64", "value": 0}, 
+  {"name": "global_rank_stride", "type": "uint64", "value": 1}, 
+  {"name": "pg_name", "type": "string", "value": "0"}, 
+  {"name": "pg_desc", "type": "string", "value": "default_pg"}, 
+  {"name": "pg_size", "type": "uint64", "value": 4}]
+      },
+      {
+        "id": 744, "name": "c10d::allreduce_", "ctrl_deps": 738,
+        "inputs": {"values": [[[742,100,0,35840,2,"cuda:1"]],"<Object>","<Object>","<None>",true,-1], "shapes": [[[1,14,2560]],[],[],[],[],[]], "types": ["GenericList[Tensor(c10::Half)]","Object","Object","None","Bool","Int"], "strides": [[[35840,2560,1]],[],[],[],[],[]]},
+        "outputs": {"values": [[[742,100,0,35840,2,"cuda:1"]],"<Object>"], "shapes": [[[1,14,2560]],[]], "types": ["GenericList[Tensor(c10::Half)]","Object"], "strides": [[[35840,2560,1]],[]]},
+        "attrs": [{"name": "rf_id", "type": "uint64", "value": 486},{"name": "fw_parent", "type": "uint64", "value": 0},{"name": "seq_id", "type": "int64", "value": -1},{"name": "scope", "type": "uint64", "value": 0},{"name": "tid", "type": "uint64", "value": 1},{"name": "fw_tid", "type": "uint64", "value": 0},{"name": "op_schema", "type": "string", "value": "c10d::allreduce_(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, __torch__.torch.classes.c10d.ReduceOp reduce_op, Tensor? sparse_indices, bool async_op=True, int timeout=-1) -> (Tensor[], __torch__.torch.classes.c10d.Work)"},{"name": "kernel_backend", "type": "string", "value": ""},{"name": "kernel_file", "type": "string", "value": ""},{"name": "tensor_range", "type": "string", "value": ""}]
+      },
+      {
+        "id": 738, "name": "_c10d_functional::all_reduce", "ctrl_deps": 737,
+        "inputs": {"values": [[734,99,0,35840,2,"cuda:1"],"sum","0"], "shapes": [[1,14,2560],[],[]], "types": ["Tensor(c10::Half)","String","String"], "strides": [[35840,2560,1],[],[]]},
+        "outputs": {"values": [[742,100,0,35840,2,"cuda:1"]], "shapes": [[1,14,2560]], "types": ["Tensor(c10::Half)"], "strides": [[35840,2560,1]]},
+        "attrs": [{"name": "rf_id", "type": "uint64", "value": 481},{"name": "fw_parent", "type": "uint64", "value": 0},{"name": "seq_id", "type": "int64", "value": -1},{"name": "scope", "type": "uint64", "value": 0},{"name": "tid", "type": "uint64", "value": 1},{"name": "fw_tid", "type": "uint64", "value": 0},{"name": "op_schema", "type": "string", "value": "_c10d_functional::all_reduce(Tensor input, str reduce_op, str group_name) -> Tensor"},{"name": "kernel_backend", "type": "string", "value": ""},{"name": "kernel_file", "type": "string", "value": ""},{"name": "tensor_range", "type": "string", "value": ""}]
+      },
+––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+
+INTERLUDE: interpreting CPU trace metadata
+“inputs”/”outputs”:
+“values”, array[0] e.g. [742,100,0,35840,2,"cuda:1"]:
+Proof of data structure exists in PyTorch source code: torch/csrc/profiler/standalone/execution_trace_observer.cpp
+convertIValue function section:
+
+ExecutionTraceObserver::ID tensor_id = getObjectID(ob, tensor_impl);
+ExecutionTraceObserver::ID storage_id = 0;
+size_t offset = 0;
+size_t numel = 0;
+size_t itemsize = 0;
+std::string device_str;
+// symbolic sizes/strides implies t->storage_offset() will fail
+if (tensor_impl->has_storage() &&
+    !tensor_impl->has_symbolic_sizes_strides()) {
+  auto& t_storage = tensor_impl->storage();
+  storage_id = getObjectID(ob, t_storage.data());
+  offset = tensor_impl->storage_offset();
+  numel = tensor_impl->numel();
+  itemsize = tensor_impl->itemsize();
+  device_str = tensor_impl->device().str();
+...
+tensor_value = fmt::format("[{},{},{},{},{},\"{}\"]",
+tensor_id, storage_id, offset, numel, itemsize, device_str);
+
+[tensor_id, storage_id, offset, numel, itemsize, device]
+    [0]         [1]      [2]     [3]      [4]      [5]
+
+tensor_id: unique ID assigned to each tensor object
+storage_id: unique ID for memory containing the tensor
+offset: data’s position as an element index from the beginning of storage buffer
+numel: total count of elements in the relevant tensor
+itemsize: bytes in a single element of the tensor
+device: string representation of where tensor is stored
+“shapes” e.g. [1,14,2560]:
+The size of the tensor in row-major ordering
+“types” e.g. “Tensor(c10::Half)”
+PyTorch datatype, c10 = tensor storage/dispatching, Half = FP16
+“strides” e.g. [35840,2560,1]:
+Used for calculating the location of an element in memory
+Exact usage unclear right now, can clarify later
+
+
+05/01/26
+INTERLUDE: how to link operations in CPU and GPU traces
+Context: The CPU traces and GPU traces capture subtly different information and the order of operations is not necessarily identical between them. Since the CPU traces preserve logical flow and dependency metadata, which the GPU traces have execution data, we obviously have an interest in combining them.
+N.B. in the generated GPU traces, actual CUDA events don’t begin reporting until ~1.76 million lines deep (approximately 97.8% through the file by LOC)
+For kernel events, the file structure changes slightly:
+
+NON-KERNEL:
+  {
+    "ph": "X", "cat": "python_function", "name": "<built-in method _disable_profiler of pybind11_... object at 0x7f25fab66ed0>", "pid": 8088, "tid": 8088,
+    "ts": 5306003164776.141, "dur": 7.070,
+    "args": {
+      "Python thread": 1, "Python parent id": 239963, "Python id": 239966, "Call stack": "torch/cuda/__init__.py(535): __exit__;torch/cuda/__init__.py(1073): synchronize;torch/autograd ...  step;profile_llm_parallel_pt_tp.py(343): <module>;", "Ev Idx": 250641
+    }
+
+KERNEL:
+  {
+    "ph": "f", "id": 11, "pid": 1, "tid": 7, "ts": 5306002698457.956,
+    "cat": "ac2g", "name": "ac2g", "bp": "e"
+  },
+  {
+    "ph": "X", "cat": "cuda_runtime", "name": "cudaStreamSynchronize", "pid": 8088, "tid": 8088,
+    "ts": 5306002698456.614, "dur": 11.782,
+    "args": {
+      "External id": 7,      "cbid": 131, "correlation": 11
+    }
+  },
+
+
+No clear reason why this change should occur → worth investigating?
+Looking at kernel entries for more detail:
+
+  {
+    "ph": "s", "id": 754, "pid": 8088, "tid": 8088, "ts": 5306002728069.118,
+    "cat": "ac2g", "name": "ac2g"
+  },
+  {
+    "ph": "X", "cat": "kernel", "name": "void cutlass::Kernel2<cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8>(cutlass_75_wmma_tensorop_f16_s161616gemm_f16_16x16_128x2_tn_align8::Params)", "pid": 1, "tid": 7,
+    "ts": 5306002728095.515, "dur": 18.175,
+    "args": {
+      "External id": 305,"queued": 0,"device": 1,"context": 1,"stream": 7, "correlation": 755,"registers per thread": 122,"shared memory": 16896,"blocks per SM": 1.000000,"warps per SM": 1.000000,"grid": [8, 5, 1], "block": [32, 1, 1],"est. achieved occupancy %": 3
+    }},
+
+If we assume 754 to be the correct id for this GEMM, and look for the corresponding id in the CPU trace, we find the following instances:
+
+STORAGE_ID = 754:
+"id": 758, "name": "aten::view", "ctrl_deps": 757,
+"inputs": {"values": [[754,44,0,35840,2,"cuda:0"],...
+...
+"id": 757, "name": "aten::reshape", "ctrl_deps": 753,
+"inputs": {"values": [[754,44,0,35840,2,"cuda:0"],...
+...
+"id": 753, "name": "aten::linear", "ctrl_deps": 5,
+"inputs": {"values": [[754,44,0,35840,2,"cuda:0"],...
+
+RF_ID = 754:
+"id": 1176, "name": "aten::reshape", "ctrl_deps": 1172,...
+"attrs": [{"name": "rf_id", "type": "uint64", "value": 754},...
+
+TENSOR_ID = 754:
+"id": 4953, "name": "aten::cat", "ctrl_deps": 5,...
+"outputs": {"values": [[4954,754,0,8960,2,"cuda:0"]],...
+...
+"id": 4984, "name": "aten::as_strided", "ctrl_deps": 4983,
+"inputs": {"values": [[4954,754,0,8960,2,"cuda:0"],...
+...
+"id": 4983, "name": "aten::transpose", "ctrl_deps": 4982,
+"inputs": {"values": [[4954,754,0,8960,2,"cuda:0"],1,2],...
+...
+"id": 4992, "name": "aten::_efficient_attention_forward",...
+"inputs": {"values": [[4985,754,0,8960,2,"cuda:0"],...
+...
+"id": 4982, "name": "aten::_scaled_dot_product_efficient_attention",...
+"inputs": {"values": [[4954,754,0,8960,2,"cuda:0"],...
+...
+"id": 4981, "name": "aten::scaled_dot_product_attention",...
+"inputs": {"values": [[4954,754,0,8960,2,"cuda:0"],...
+
+ID = 754: NO RESULTS PRESENT IN TRACE
+
+In the GPU trace `"id": 754` is unique, however, in the CPU trace the only instance where that same id was unique was for an the rf_id field of an aten::reshape function which doesn’t match the kernel’s GEMM
+THEREFORE –> GPU “id” ≠ CPU “rf_id”
+The efficient attention functions in the tensor_id list are probably no correct since there is a specific fmha kernel we have seen for attention specifically: fmha_cutlassF_f16_aligned_32x128_rf_sm75(PyTorchMemEffAt...
+THEREFORE (probably) –> GPU “id” ≠ CPU “tensor_id” 
+In the storage_id list, the only operation it could be is aten::linear, however it would be strange if the id connects to the storage_id and even more strange that the id is unique in one list but not the other. 
+THEREFORE (unlikely) –> GPU “id” = CPU “storage_id”
+REALISATION: chakra tooling combines both traces, it surely must know how to match operations between the two traces
+ID routing pattern appears to be:
+
+[GPU TRACE] Kernel “correlation” –> 
+[GPU TRACE] Launch kernel “correlation” –> 
+[GPU TRACE] Launch kernel “external id” –> 
+[GPU TRACE] CPU op “external id” –> 
+[GPU TRACE] CPU op “record function id” –> 
+[CPU TRACE] CPU op “rf_id”
+
+
+Test for kernel example, (“id”: 754)
+"void cutlass::Kernel2<cutlass_75... –> “correlation”: 755
+“correlation”: 755 –> “id”: 755,”name”:“cuLaunchKernel” –> “external id”: 305
+“external id”: 305 –> ”name”:“aten::addmm” –> “record function id”: 306
+“record function id”: 306 –> “rf_id”: 306 –> “id”: 456,”name”:“aten::addmm”
+Seems to work as expected, just need to check universality
+Tested on fmha_cutlassF_f16... kernel (id: 1003), correctly routed to aten::_efficient_attention_forward (id:651)
+
+
+07/01/26
+RETURN TO Q3
+Expecting two collectives per layer (1 for Atten, 1 for MLP)
+Appears to be impossibilities in the trace e.g.
+Attention AllReduce executes at 5306002875784.096
+MLP fc1 begins execution at 5306002875739.299
+So the kernel launches roughly 44 microseconds before and lasts 69 microseconds. Therefore unless the collective effectively completed in that ~25 microsecond gap (highly unlikely), something erroneous is happening:
+
+HYPOTHESES:
+Understanding of which operations need full results is incorrect [FALSE]
+The FC1 operation should require the full attention result and even if not, almost the entire remainder of the layer completely executes (FC2 completes at 5306002875998.229 while the collective ends at 5306002884962.006, ~8964 microseconds later) so as well as not being a typical transformer architecture, it would mean that the full attention result is solely used for residual additions and layernorm 
+The collectives are not actually appearing in the order we believe [PENDING]
+The best way to diagnose this is to identify which collectives correspond to which pieces of information being communicated. We clearly see alternating in collectives where one takes ~9ms, the next takes ~4ms, and the cycle repeats. Clearly one of these regularly corresponds to the attention-related AllReduce, and the other to the MLP partial results
+Most obvious reason for timing differences is the size of information being communicated, however we expect the size of both collectives to be [B,S,H], confirmed by the trace, both 35840 elements at fp16
+SECONDARY ISSUE: why are identical comms consistently showing differences in execution time? Potential causes:
+Pre-sync operation execution time variance
+Staggering of ranks reducing contention for resources
+Pre-established NCCL channels/buffers
+Memory subsystem effects and cache friendliness
+Comp-overlapping resource costs
+Algorithm implementation/chunking differences
+Synchronisation event overheads
+We’ll return to this issue later, as it pertains to sim accuracy
+My suspicion is that the layer boundaries we have taken to be true could be wrong. The layer boundaries can’t be incorrect since the attention needs the complete output of the previous layer to compute but perhaps results are cached and communicated in a non-trivial manner
+Brief analysis shows nothing suspicious with respect to ordering
+
+
+The particular kernel labels we’re looking at are the wrong ones [MAYBE]
+Potential that code is catching the wrong operations e.g. for compute – launch or dispatcher kernels instead of actual execution, or – for collectives – kernels aren’t the actual comms
+
+
+
+ 
+The top chart shows the timings following cpu dispatchers where the second shows kernel-level timings (where available). There are only seeming impossibilities in the CPU-based timeline
+However looking back at the labels we used to flag this initial issue, both correspond to “kernel” category operations so actually they definitely aren’t dispatchers and the issue remains.
+Apparent question is why, looking at the chart for the same layer that we initially got the erroneous observation from, we can’t see the overlap.
+For these timelines, I specifically used the tensor and storage ids from the CPU trace for the operations to trace dependencies recursively to a depth of 10 on as many branches are created. If there isn’t an issue with this code, then the reason that the operation doesn’t show up is because it actually corresponds to a completely different layer’s compute (admittedly seems odd)
+Looking back at the example result:
+
+AllReduce (post-attention) 
+name: ncclDevKernel_AllReduce_Sum_f16_Ring...
+timestamp: 5306002875784.096
+duration: 9177.910
+external id: 2386
+cpu op name: record_param_comms
+record function id: 2387
+cpu trace id: 3937
+
+MLP FC1 (column-parallel)
+name: void cutlass::Kernel2<cutlass_75_wmma...
+timestamp: 5306002875739.299
+duration: 68.924
+external id: 2401
+cpu op name: aten::addmm
+record function id: 2402
+cpu trace id: 3962
+
+‘ctrl_deps’ field would suggest that addmm logically follows. So we’ll trace data dependencies back to see if/when they collide:	
+
+
+08/01/26
+id: [input_tensor_ids], [ids_where_output_shares_tensor_id]
+3962: [3963,3952,3959], [3955,3957,3958,3951]
+3955,3957,3958: [3956], [N/A]
+3951: [3944], [3942,3943]
+3942,3943: [3681], [3676,3679,3680]
+3676,3679: [3675,3677,3678], [3674]
+3680: [N/A], [N/A] (aten::empty)
+3674: [3673,3305], [3672,3667,3304]
+3672: [3564,3660], [3560,3561,3562,3563,3565,3656, 3657,3658,3659,3661,3668,3670]
+3304: [3303,2935], [2934,3297,3302]
+3560, [3557], [3556]
+Ignore others for now
+
+Having made a script to automate this process, and searching with a depth of 10 steps both upstream and downstream of the GEMM, we do not encounter “id”: 3937. However, we do encounter an upstream collective and downstream one:
+
+Upstream: 	3962 –> 3560 (Codename AllReduce1)
+_c10d_functional::all_reduce @ rf_id: 2163
+		c10d::allreduce_ @ rf_id: 2168
+		nccl:all_reduce @ rf_id: 2170
+record_param_comms @ rf_id: 2169 
+
+	ncclDevKernel_AllReduce_Sum_f16_RING… @ 5306002862258.642, 9736.249µs
+
+Downstream: 	3962 –> 4026 (Codename AllReduce2)
+_c10d_functional::all_reduce @ rf_id: 2433 
+c10d::allreduce_ @ rf_id: 2438
+		nccl:all_reduce @ rf_id: 2440
+record_param_comms @ rf_id: 2439
+
+ncclDevKernel_AllReduce_Sum_f16_RING… @ 5306002884964.406, 3375.436µs
+
+Take 5306002862258.642 as t=0:	t=00000.000	AllReduce1 begins
+t=09736.249	AllReduce1 ends
+t=13480.657	GEMM begins
+t=13525.454	(Target) AllReduce begins
+t=13549.581	GEMM ends
+t=22703.364	(Target) AllReduce ends
+t=22705.765	AllReduce2 begins
+t=26081.201	AllReduce2 ends
+
+Two things to observe here: (1) the timeline for the operations that are linked via data dependencies makes sense – suggesting that the kernels we’re using to observe them are correct. (2) We do, in fact, have a collective overlapping but it isn’t linked via data dependencies to this chain of operations – suggesting there is some parallel asynchronous computation going on.
+
+The challenge is how this pseudo-parallel asynchronous computation happens without bottlenecking or regularly forcing some global synchronisation. There can’t be any microbatching in the typical sense since we’re looking at a single input.
+
+
+
+By plotting the dependency-informed computational graphs centred on the two operations of interest (depth of 20 steps upstream and downstream of the original op), we can see some shared operations, namely a cudaLaunchKernel, aten::add, and its resulting kernels. We can also see one of the collectives being performed in one ‘stream’, while some execute in both. This could simply be an issue of the depth of upstream ops.
+
+Extending upstream op search depth (see next plot) to 30 and downstream to 15, we can see the majority of collectives are shared. There could also be an issue of the dependency tracking that’s resulting in incorrect distinctions between the two chains.
+
+
+Searching at a depth of 50 in both directions yields a plot (see below) that seems to break the notion of these chains actually being distinct. A handful of operations (~3%) don’t belong to the shared chain, and we should investigate whether this is simply an error in the logic or actually a meaningful difference.
+
+
+
+NOTE: unlikely to be an error, actually expected behaviour as our approach only cares about direct dependency i.e. ancestry but not full computational subgraph mapping. For example, looking upstream we look for producers of inputs, however we don’t then search over all consumer nodes, only logging the ones we arrived from. This helps explain the large number of ‘other’ ops and the mismatch in shared ones. Additionally, note the full depth search didn’t complete in every direction (terminating nodes).
+TASK CONSIDERED TO BE COMPLETE – translation of trace into DAG is distinct future task
+
+Other potential causes (unexplored):
+Collective actually executes in much shorter time than expected
+Some synchronisation event we are missing actually govern correctness
+Timestamp logging implementation is the source of erroneous results
+
+Structuring Conversations:
+Seems most sensible to structure conversations in the following manner:
+Purpose and Opportunities
+High-level objectives
+Scenarios and desired outcomes
+Current problems
+Hypothesised use cases
+Purpose of existing solutions
+Synthesise Requirements List
+Stakeholder-specific requirements
+Potential performance constraints
+Apparent Design Choices
+Compare existing implementations
+Ideate on abstractions & mechanisms
+Prototype Specification
+
+[Meeting Synthesis]
+Purpose and Opportunities:
+Obvious interest in having a standard format that users’ workloads are mapped to for the purposes of making our optimisations convenient
+Somewhat relies on knowing what those optimisations will be
+In the short-term, we would at least want the IR for internal optimisations, having a standard format to make tooling design easier
+Relies on being able to convert ‘available’ formats to ours
+Another slightly less necessary tool is a universal hardware representation in order to expose hardware optimisations and improve simulation flexibility
+System-level representation is perhaps quite easy to imagine
+Potential interest in having representation specifically for chips, one format that any chip of any type can be decomposed into
+Would allow for a single simulator to be built to test speed, energy consumption, etc for any chip architecture
+‘Any’ chip might be difficult to model, perhaps only Van Neumann architectures, perhaps there is a fully flexible representation if just thinking in terms of memory units and traces w/ varying bandwidths?
+Beyond the mapping of workloads to resources, we also want to be able to expose reconfigurations in the hardware and software that improves the mapping
+Two ‘tiers’ of optimisations obvious for software:
+Optimisation in the way a script implements an intended algorithm, requires knowing the underlying algorithm being implemented
+Reconfigurations to/replacement of the algorithm itself or the parameters of the algorithm which requires identifying the underlying algorithm, the abstract intent behind said algorithm, and (for deep learning) the effect on system-level behaviour or (for many other workloads) the final numerical correctness
+Benefit in having IR designed for analytical work to allow e.g. visualisation, easy evaluation of problem complexity, measuring criticality and heterogeneity, expose the nature of the problem, etc.
+
+Obvious Requirements:
+‘Universal’ → universally applicable wrt. compute and workload
+Fundamentally a resource mapping problem being solved, could take inspiration from how problem is addressed in other contexts
+Key difference is we wish to optimise the `supply` and `demand` not just find the optimal mapping. Even the terms supply/demand and source\target imply a chronology of mapping, but we should be able to optimise either way i.e. expose both sw and hw changes
+Same point differentiate the work from something like MLIR that compiles in one direction: task→IR1→IR2→…→compute
+Whereas we seemingly want: task→IR→JointIR<–IR<–compute perhaps
+In fairness, finding/exposing optimisation in the algorithms is definitely more immediately useful, and more practical (for now)
+Expect universality in workload representations to be somewhat challenging for our purposes due to different nature of certain workloads e.g. presence of control flow logic, interrupts, conditional compute, etc
+Mapping of any workload, from any source, in any language, to our format
+Need to design in a way that it can conveniently drop into any workflow but also any stack – translate it from compiled C?
+For example, we should be able to import into PyTorch but also have a tool that Ansys could drop into their software too
+Have to balance a format that is highly expressive but computationally feasible to generate, read, and manipulate – does this simply depend on no. of nodes?
+
+Open Questions:
+Is the information best represented in a single IR or many IRs?
+What is the landscape of all computational functions?
+What abstractions can be made of chips? How widely do they generalise?
+What topologies might be useful for representing information?
+How could we visualise the output space of a function? What is the utility?
+In what format does a random workload (e.g. FE in Ansys) exit the programme?
+Can we sit outside of the current stack or need to slot in?
+Any computation expressible in mathematical notation, but how do we build our taxonomy, at what level of abstraction, and with what primitives?
+Do we need taxonomies like compilers use? Why?
+How are protobuf formats designed for rapid write and read speeds? Which variables affect these speeds and what scaling performance do they exhibit?
+
+For next week:
+Guillhem
+Explore the landscape of compute functions and chip architecture. No precise aspects of the landscapes to explore (geometry, existence of generating families, size,...).
+Clarify why I would like to have some such representation.
+
+Hamzah
+Explore some existing workload IRs at different abstraction levels
+Enumerate my immediate needs from various representations
+Begin thinking about design space and obvious places to start
+Define reasonable success criteria for the project given the timeline
+
+
+[HC] 05/12/25
+From Previous Meeting (undocumented):
+Guillhem’s idea: using the base set theoretic operations (union, intersect, and complement) to construct any operation we may wish to represent
+Each operation theoretically lies in some part of this 3D space?
+Does certain hardware have different costs for the various paths to any particular point? Can you go backwards in any of these axes? Does it matter?
+Discussed specific requirements for v1 of a universal workload representation, currently being explored in the trace translation sprint
+Current plan is a DAG with 2 node types, one representing computations and the other representing memory objects. Edges would represent dependencies (which become communication if parent and child nodes belong to different devices). Hypothesis is that representing the memory objects separately would allow for finding more powerful optimisations.
+
+Potential Issue: set theoretic operators can express predicates and membership but might themselves be too weak to represent arbitrary computational operations
+
+Other Workload Suggestions (from brief research) [HC]:
+Category theory view – objects, morphisms, compositions
+Monoidal categories to include tensor products? My understanding is that plain categories only allow you to represent operations (compose morphisms) sequentially but we would want to be able to represent parallel computations, hence the need to introduce the tensor product
+Are there other operations that would need to be added to the category?
+Natural benefit is every monoidal category having a complete graphical calculus – Joyal-Street string diagrams? Link1, link2, link3
+Plain monoidal categories able to represent recursion, iteration, unbounded loops, conditional branching, etc?
+Computability theory view – Church numerals, pairs, booleans, and recursion
+Expanding set theoretic view – incl. relational algebra?
+Might still not be able to represent recursion, unbounded iteration, etc?
+Need transitive closure to express recursion and therefore also represent reachability, dependency propagation, loops on arbitrary depth?
+Turing machines – perhaps too verbose for what we need?
+Cartesian Closed Category – intersection of category theory and lambda calculus
+Also lack recursion by default, need the fixpoint operator?
+The Curry–Howard–Lambek correspondence? Relevance to our objectives?
+CCC + fixpoints = Turing-complete functional programming language
+Based on naive understanding and brief research, seems most promising
+
+N.B. for workload representation we assume a need for representation capable of expressing the full detail, whereas with hardware we may be prioritising knowing certain things over others, for example we could assume functional correctness of the hardware and simply model performance in a universal way
+
+With the hardware representation we also have to query whether there are representations that can represent entirely arbitrary hardware. For example, does a representation for more typical digital silicon chips also apply to neuromorphic, analog, quantum, photonics, thermodynamic, etc compute?
+
+Hardware Suggestions (from brief research) [HC]:
+Graph rewriting systems
+Universal cost models (Blum’s complexity axioms)
+Register machines
+Microarchitectural models
+Pipeline diagrams, reorder buffers, cache hierarchy, etc
+Existing hardware descriptions
+RTL nets, Verilog ASTs, etc
+Logic gate model/boolean circuits
+Transistor-level SPICE description
+Meta-representations
+Roofline, queueing models, etc
+Universal performance proxy
+
+Takeaways from meeting:
+Category theory appears to be useful for our purposes, however the scope of this utility and specific tooling is not understood yet
+Due to the highly abstract nature, there is also a question of utility. Being able to generally represent operations as compositions of morphisms is more useful if there is some common set of base morphisms that have some intrinsic link to the hardware/cost
+This ‘intrinsic link’ is the enabler for some set of axes where the placement of an operation has some semantic meaning with respect to hardware cost/time taken/energetic cost/ etc
+These are essentially embedding spaces where, in the case that we have our original three set theoretic axes (intersect, union, and complement), the manhattan distance of an operation from the origin can be linked back to hardware cost via some design-informed mapping
+Reiterate purposes of the IRs, primary motivation is mapping of algorithms to hardware, however, we also want to find algorithmic optimisations and potentially swap out algorithms to ones with a similar intention but preferable implementation – do these objectives motivate different IR requirements?
+
+
+Single representation nested approaches
+Representing feasible/possible operations
+Lattice as representation
+Auto-derive parts of lattice that aren’t attainable
+Admissible computation gives constrained lattice
+Constrained vectors in motion primitives
+
+Combining chip’s spaces/embedding into different axes for various chips
+
+Still no discussion of probabilistic workloads
+Evolution of workloads with the task
+
+Category theoretical tools
+What makes one computation more costly than the other
+Can we create an abstract construction of cost from the chip design
+Energetic cost?
+
+
+12/12/25
+Defining Computability Vectors [HC]:
+Chip could be said to be Turing complete if the following are satisfied:
+Symbol manipulation – ability to read/write/change symbols on tope
+Conditional branching – conditionals and control flow
+Iteration/repetition – unbounded repetition, loops, recursion, etc.
+(while ignoring finite storage and any time constraints)
+In theory any chip alongside a CPU makes for a Turing-complete system, perhaps this isn’t the best way to think about the limits of certain hardware
+Instead we imagine a space of all computable operations, within which exists subsets corresponding the the reachable space for specialised hardware
+How do we define the limits of this reduced computability space?
+Mapping onto existing models of computation?
+Sequential: finite-state, post, pushdown automata, register (random-access), turing, decision tree, external memory
+Functional: abstract rewriting, combinatory logic, general recursive functions, lambda calculus
+Concurrent: actor model, cellular automaton, interaction nets, khan process networks, logic gates, digital circuits, petri nets, process calculus, synchronous data flow
+^The above should be investigated for potential inspiration
+If using this approach, the axes of the computability space could be memory capability, control flow flexibility, instruction/ primitive set, integration/communication with controller
+See also: introduction to computability
+Utility of Chomsky hierarchy? Model-of-computation theories?
+Right now we’re more interested in the ‘primitive set’ specifically:
+Option 1: Discrete operation space
+Option 2: Mathematical function space
+Option 3: Decompose further
+Pick some basis function e.g. monomials, fourier, wavelets
+Recursive base operators in a continuous space
+CHALLENGE: The ‘base’ operators for a given accelerator would naturally be its instructions, but this doesn’t create for a universal hardware-agnostic space for representing operations
+Perhaps this is solved by having the axes be something less hardware-motivated but more expressive e.g. the monoidal category and we actually build up ‘instructions’ as computability vectors in this primitive space
+Semantic-first approach, not microarchitectural
+N.B. we expect an operation in this space of primitives to be a ‘trace’ traversing the space, however, we should expect that this trace has multiple branches at time, there are hidden edges to various points indicating the flow of data in and out, but also – given we want to make estimations of time cost for operations – we should be able to distinguish between SISD, SIMD, MIMD, and SIMT (Flynn’s taxonomy)
+
+Category theory [GA]:
+REF: https://arxiv.org/pdf/1612.09375 (one of the best introduction, by Tom Leinster (here he spawns again))
+How may it help? (bullet point for people who know nothing about category theory, written for pedagogical purpose and to shape the research narrative. It is to build intuition.)
+Motivated definition: The aim of category theory is to construct an abstract space where systems of study are categories and relations (functors) between those categories. A category is a set of elements called objects alongside a collection of morphisms between each pair of objects.  
+One of its powers lies in its universality, illustrated  by universal property. Results in one category can be conveyed in other categories (not all). For us category theory will help us to generalize results obtained on a given class of workloads (i.e. workloads operating on sets) to other classes.
+If a universal workload representation (and not universal representation) would be a formal, abstract model that captures the structure and interactions of any workloads, independent of its implementation that help us reason about, compare, compose or transform workloads then category theory naturally aligns with this aim. 
+Challenges:
+Main challenge: Very abstract -> difficulty to make it practical, to encompass memory usage, latency or energy cost. It is not sure whether the sensible issue raised by Hamzah: “Due to the highly abstract nature, there is also a question of utility. Being able to generally represent operations as compositions of morphisms is more useful if there is some common set of base morphisms that have some intrinsic link to the hardware/cost” is realistically solvable. Though my intuition is that basic operation (morphisms) could be linked to energy via the amount of entropy they reduced.
+Mid challenge: entry cost on the understanding of the theory. 
+My opinion:
+With this short dive into this mathematical piece, I believe it is interesting to investigate more on category theory. 
+I believe it is a good strategy to allocate a month (or up to end of January) on solving the question: “How one can use category theory to represent in a universal way computing workloads”
+Next step: Create the category of workloads which might be a CCC.
+
+Takeaways from meeting:
+Category theory appears to be a natural tool for representing workloads
+Bottlenecks: linking w/ energy cost, practicality for mapping?
+Have to be careful not to overfit all objectives to any one representation (unless it lends itself to all the objectives quite naturally)
+e.g. maybe discussion about space to represent arbitrary operations with base computability vectors doesn’t lend itself to cost modelling
+Perhaps, specifically for the cost-modelling, we’d want a representation or tool that ingests our high-D ‘trace’ to compute estimated cost
+Implicit hidden vectors in our current idea that map memory flow?
+Leave them out of this model? Do all hardware pieces even need this?
+TO CLARIFY: Does the current space we’re discussing concern itself with specific operation within a workload rather than the whole thing? At what level of abstraction do the operations go to – perhaps this second part is answered implicitly by saying whatever the base computational primitives of that HW are
+MAIN OPEN QUESTION: if we have this space to represent arbitrary operation, based on our discussion a space where the various axes relate to some base operation where moving in the increasing direction implies additional application of said base operation, what should these ‘base operations’ be?
+
+For GA: continue investigation into category theory & its utility
+For HC: latency petri net paper review, chomsky hierarchy review
+
+N.B. Potentially useful paper: IR2Vec: LLVM IR Scalable Program Embeddings
+
+
+09/01/26
+Chomsky Hierarchy [HC]:
+Defined a spectrum of expressiveness vs ability to analyse
+Classification of formal languages based on restrictions on the grammar that generates them, and what kind of abstract machine is required to recognise it
+Any of our universal representations trade-off:
+Expressiveness – variety and resolution of what can be represented
+Structure – what can be reasoned about/optimised/verified
+Cost – increase in difficulty/intensity of scheduling/mapping/compiling
+Type 3 –> Type 0: INCREASE in expressiveness, structure, and cost
+––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+
+LANGUAGE	GRAMMAR		PARSER					|
+Type 3		Regular		Finite Automaton			|  Gain power
+Type 2		Context-Free		Pushdown Automaton			|    & lose
+Type 1		Context-Sensitive	Linear Bounded Automaton		|  guarantees
+Type 0		Unrestricted		Turing Machine			v
+
+––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+
+Helps explain why certain problems are impossible with simpler tools
+E.g. regex not able to parse nested parentheses
+Desire to keep syntax simple, parse efficiently, avoid unnecessary power
+In this context, the ‘grammar’ is the set of rules for generating strings
+The ‘parser’ takes a string, determines if it belongs to the grammar, and builds a parse tree – parsers well understood for context-free languages
+Historical examples promote layering and composition:
+Compilers and intermediate representations:
+Hierarchy:
+Source language: 		Type 0
+Abstract syntax tree: 	Type 2
+Control flow graph & SSA:	Type 2
+Instruction stream:		Type 3
+Each stage:
+Removes expressiveness
+Increases analysability
+Exposes structure for optimisation
+SQL and relational algebra:
+SQL designed as declarative, queries capture desire
+Internally, SQL –> relational algebra –> execution plan
+Language restrictions allows database to:
+Reorder operations, parallelise safely, estimate cost, etc
+
+For which levels are there formal guarantees and pre-existing solutions?
+How to generalise problem into known (solved) problem structures?
+Do scripts (workloads) and hardware have a natural ‘Type’ at which they reside?
+
+
+23/01/26
+[GA] Introduction to Category Theory:
+The presentation of this theory follows (and will follow for the next sessions the book https://arxiv.org/pdf/1612.09375. The presentation of the theory will split into several one-to-one sessions. 
+At this present stage, especially semantically category theory makes sense as a tool for our universal representation. The short-term goal of these presentations is to get a deeper understanding for G and a high-level understanding for H of this piece of math. The aim is to assess the use of such a theory to represent the space of computation in a standard way. My intention is to 
+
+
+First definitions and examples (section 1 and 2 of the book):
+
+------------------------------------------------------------------------------------
+Universal properties
+				   
+------------------------------------------------------------------------------------
+
+Categories: A category is a collection of objects, maps, or arrows, or morphisms and identity laws, endowed with a composition function ◦ such that:
+For any triplets of objects A, B, C and any maps f: A -> B, g: B -> C, the function g◦f: A -> C is a map.
+The composition of maps is associative.
+For any map f: A -> B, there are identity laws: f ◦ 1 = f = 1 ◦ f
+
+
+“A category is a collection of objects related to one another to a greater or lesser degree; a discrete category (i.e. a category containing no maps at all apart from identities) is the extreme case in which each object is totally isolated from its companions.”
+Isomorphisms, dual category, principle of duality
+
+------------------------------------------------------------------------------------
+
+Functors: For any pair of categories, a functor F from one category to the other is a function sending any object of the former to an object of the latter category such that:
+ For any pair of objects A, A’ of the first category, each arrow from A to A’ has an image by F which is an arrow from F(A) to F(A’). The image of this arrow f is noted F(f).
+For any pair of arrow f,f’ in the first category F(f◦f’)=F(f)◦F(f’).
+For any object A of the first category, the identity map of A is sent by the functor onto the identity map of F(A).
+CAT (category of categories)
+forgetful functors, free functors, presheaf
+Faithful functors, full functor 
+
+“We can tell a lot about a space by examining the functions on it. The   importance of this principle in twentieth- and twenty-first-century mathematics can hardly be exaggerated.”
+
+------------------------------------------------------------------------------------
+Natural Transformations
+
+------------------------------------------------------------------------------------
+
+Link to universal representation:
+Equivalence, universal properties -> constructing bridges -> so a representation for such computation is the same for such other computations because ...
+The space of compute functions: a category? a closed-cartesian category?
+
+
+
+INSTRUCTION: Parse this file and in less than 10 words, tell me what the biggest challenge faced in the tasks undertaken was. Again, 10 words or less anything else is a failure

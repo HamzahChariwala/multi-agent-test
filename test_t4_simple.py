@@ -41,13 +41,23 @@ async def test_generate_endpoint():
     # Test generation
     logger.info("\nStep 2: Testing generation...")
     
+    # Read prompt from sample.txt
+    sample_file = Path(__file__).parent / "sample.txt"
+    if sample_file.exists():
+        with open(sample_file, 'r') as f:
+            prompt_text = f.read()
+        logger.info(f"Loaded prompt from sample.txt ({len(prompt_text)} characters)")
+    else:
+        prompt_text = "What is the capital of France?"
+        logger.warning("sample.txt not found, using default prompt")
+    
     request = {
-        "task_prompt": "What is the capital of France?",
-        "max_tokens": 50,
+        "task_prompt": prompt_text,
+        "max_tokens": 15,
         "request_id": "test_request_001"
     }
     
-    logger.info(f"Sending request: {request['task_prompt']}")
+    logger.info(f"Sending request with prompt: {prompt_text[:100]}... (truncated)")
     
     start_time = time.time()
     
