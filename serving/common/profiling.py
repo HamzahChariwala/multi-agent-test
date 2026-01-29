@@ -129,66 +129,7 @@ class ProfilerContext:
         trace_file = self.output_dir / f"{self.request_id}_trace.json"
         self.profiler.export_chrome_trace(str(trace_file))
         
-        # Export summary
-        self._export_summary()
-        
         return False
-    
-    def _export_summary(self):
-        """Export profiling summary statistics."""
-        if self.profiler is None:
-            return
-        
-        summary_file = self.output_dir / f"{self.request_id}_summary.txt"
-        
-        try:
-            # Get key averages
-            key_averages = self.profiler.key_averages(group_by_input_shape=True)
-            
-            with open(summary_file, 'w') as f:
-                f.write(f"Profiling Summary for {self.gpu_id} - Request {self.request_id}\n")
-                f.write("=" * 80 + "\n\n")
-                
-                # Top operations by CUDA time
-                f.write("Top 10 Operations by CUDA Time:\n")
-                f.write("-" * 80 + "\n")
-                sorted_by_cuda = sorted(
-                    key_averages,
-                    key=lambda x: x.cuda_time_total,
-                    reverse=True
-                )[:10]
-                for evt in sorted_by_cuda:
-                    f.write(f"{evt.key:60s} {evt.cuda_time_total/1000:.2f} ms\n")
-                
-                f.write("\n")
-                
-                # Top operations by CPU time
-                f.write("Top 10 Operations by CPU Time:\n")
-                f.write("-" * 80 + "\n")
-                sorted_by_cpu = sorted(
-                    key_averages,
-                    key=lambda x: x.cpu_time_total,
-                    reverse=True
-                )[:10]
-                for evt in sorted_by_cpu:
-                    f.write(f"{evt.key:60s} {evt.cpu_time_total/1000:.2f} ms\n")
-                
-                f.write("\n")
-                
-                # Memory statistics
-                f.write("Memory Statistics:\n")
-                f.write("-" * 80 + "\n")
-                sorted_by_mem = sorted(
-                    [e for e in key_averages if e.cpu_memory_usage > 0],
-                    key=lambda x: x.cpu_memory_usage,
-                    reverse=True
-                )[:10]
-                for evt in sorted_by_mem:
-                    mem_mb = evt.cpu_memory_usage / (1024 * 1024)
-                    f.write(f"{evt.key:60s} {mem_mb:.2f} MB\n")
-        
-        except Exception as e:
-            print(f"Warning: Could not export summary: {e}")
     
     def step(self):
         """Advance profiler to next step (for iterative operations)."""
