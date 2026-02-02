@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 from typing import Optional, List
 from contextlib import contextmanager
+import logging as logging_module
+import threading
 
 import torch
 import yaml
+
+logger = logging_module.getLogger(__name__)
 
 
 class ProfilerContext:
@@ -18,20 +22,26 @@ class ProfilerContext:
         gpu_id: str,
         request_id: str,
         config_path: str = "./config/profiling.yaml",
-        enabled: Optional[bool] = None
+        enabled: Optional[bool] = None,
+        split_by_gpu: bool = False,
+        num_gpus: int = 4
     ):
         """
         Initialize profiler context.
         
         Args:
-            gpu_id: GPU identifier (e.g., 't4_gpu0', 'a100_gpu1')
+            gpu_id: GPU identifier (e.g., 't4_gpu0', 'a100_gpu1', 'a100_synthesis')
             request_id: Unique request identifier
             config_path: Path to profiling configuration file
             enabled: Override config to enable/disable profiling
+            split_by_gpu: If True, split combined trace into per-GPU traces
+            num_gpus: Number of GPUs to split across (if split_by_gpu=True)
         """
         self.gpu_id = gpu_id
         self.request_id = request_id
         self.config = self._load_config(config_path)
+        self.split_by_gpu = split_by_gpu
+        self.num_gpus = num_gpus
         
         # Check if profiling is enabled
         env_enabled = os.getenv("ENABLE_PROFILING", "").lower() in ("true", "1", "yes")
@@ -48,7 +58,8 @@ class ProfilerContext:
         
         # Setup output directory
         base_dir = self.config.get("output_base_dir", "./profiling_traces")
-        self.output_dir = Path(base_dir) / gpu_id
+        self.base_dir = Path(base_dir)
+        self.output_dir = self.base_dir / gpu_id
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.profiler = None
@@ -115,11 +126,18 @@ class ProfilerContext:
             return False
         
         # Stop ExecutionTraceObserver first
+        et_created = False
         if self.et_observer is not None:
             try:
                 self.et_observer.stop()
                 self.et_observer.unregister_callback()
-                print(f"Exported ExecutionTrace to: {self.et_file}")
+                # Check if file was actually created
+                if os.path.exists(self.et_file):
+                    file_size = os.path.getsize(self.et_file) / (1024 * 1024)  # MB
+                    print(f"✓ Exported ExecutionTrace to: {self.et_file} ({file_size:.1f} MB)")
+                    et_created = True
+                else:
+                    print(f"⚠ ExecutionTrace file not created: {self.et_file}")
             except Exception as e:
                 print(f"Warning: Could not export ExecutionTrace: {e}")
         
@@ -127,7 +145,40 @@ class ProfilerContext:
         
         # Export Chrome trace directly (no schedule means no on_trace_ready callback)
         trace_file = self.output_dir / f"{self.request_id}_trace.json"
-        self.profiler.export_chrome_trace(str(trace_file))
+        trace_created = False
+        try:
+            self.profiler.export_chrome_trace(str(trace_file))
+            if os.path.exists(trace_file):
+                file_size = os.path.getsize(trace_file) / (1024 * 1024)  # MB
+                print(f"✓ Exported Chrome trace to: {trace_file} ({file_size:.1f} MB)")
+                trace_created = True
+            else:
+                print(f"⚠ Chrome trace file not created: {trace_file}")
+        except Exception as e:
+            print(f"Warning: Could not export Chrome trace: {e}")
+        
+        # Split traces by GPU if requested (in background to avoid blocking)
+        if self.split_by_gpu and (trace_created or et_created):
+            def _split_in_background():
+                try:
+                    from serving.common.trace_splitter import split_traces
+                    logger.info(f"Splitting traces into per-GPU directories (background)...")
+                    split_traces(
+                        combined_trace_dir=str(self.output_dir),
+                        request_id=self.request_id,
+                        output_base_dir=str(self.base_dir),
+                        num_gpus=self.num_gpus,
+                        cleanup_combined=True  # Delete combined traces after splitting
+                    )
+                    logger.info(f"✓ Traces split into a100_gpu{{0..{self.num_gpus-1}}} directories")
+                except Exception as e:
+                    logger.error(f"Trace splitting failed: {e}")
+                    logger.exception("Trace splitting exception")
+            
+            # Run splitting in background thread to not block HTTP response
+            split_thread = threading.Thread(target=_split_in_background, daemon=True)
+            split_thread.start()
+            print(f"Trace splitting started in background (check logs for completion)")
         
         return False
     
