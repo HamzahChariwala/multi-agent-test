@@ -17,10 +17,10 @@ from transformers import DynamicCache
 from serving.common.model_loader import load_model
 from serving.common.inference import generate
 from serving.common.profiling import profile_operation, is_profiling_enabled
-from serving.common.continuous_profiler import get_manager, record_request_activity
+from serving.common.simple_profiling import simple_profile
 from serving.t4_cluster.kv_transfer import synchronize_ranks
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -63,11 +63,8 @@ class SimpleDecodeWorker:
         synchronize_ranks()
         logger.info(f"[Rank {self.rank}] Synchronized with all workers")
         
-        # Start continuous profiler monitoring
-        if self.profiling_enabled:
-            manager = get_manager(idle_timeout=30.0)
-            manager.start_monitoring()
-            logger.info(f"[Rank {self.rank}] Started continuous profiler monitoring")
+        # Profiling is handled per-operation via profile_operation() calls
+        logger.info(f"[Rank {self.rank}] Profiling enabled: {self.profiling_enabled}")
     
     def receive_kv_cache(self, num_layers: int, key_shape: Tuple, value_shape: Tuple):
         """Receive KV cache broadcast from rank 0 and return DynamicCache."""
@@ -130,63 +127,62 @@ class SimpleDecodeWorker:
                         f"batch_size={batch_size}, seq_len={seq_len}, max_tokens={max_tokens}"
                     )
                     
-                    # Mark request activity for continuous profiling
-                    if self.profiling_enabled:
-                        record_request_activity(gpu_id, "two_phase_session")
+                    # Profile Phase 1
+                    with simple_profile(gpu_id, f"{request_id}_phase1", enabled=self.profiling_enabled):
                     
-                    # Receive input_ids
-                    with profile_operation("receive_inputs", gpu_id, request_id, self.profiling_enabled):
-                        input_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=self.device)
-                        dist.broadcast(input_ids, src=0)
+                        # Receive input_ids
+                        with profile_operation("receive_inputs", gpu_id, request_id, self.profiling_enabled):
+                            input_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=self.device)
+                            dist.broadcast(input_ids, src=0)
                     
-                    # Receive KV cache
-                    with profile_operation("receive_kv", gpu_id, request_id, self.profiling_enabled):
-                        num_layers = self.model.config.num_hidden_layers
-                        num_heads = self.model.config.num_attention_heads
-                        head_dim = self.model.config.hidden_size // num_heads
+                        # Receive KV cache
+                        with profile_operation("receive_kv", gpu_id, request_id, self.profiling_enabled):
+                            num_layers = self.model.config.num_hidden_layers
+                            num_heads = self.model.config.num_attention_heads
+                            head_dim = self.model.config.hidden_size // num_heads
                         
-                        key_shape = (batch_size, num_heads, seq_len, head_dim)
-                        value_shape = (batch_size, num_heads, seq_len, head_dim)
+                            key_shape = (batch_size, num_heads, seq_len, head_dim)
+                            value_shape = (batch_size, num_heads, seq_len, head_dim)
                         
-                        past_key_values = self.receive_kv_cache(num_layers, key_shape, value_shape)
+                            past_key_values = self.receive_kv_cache(num_layers, key_shape, value_shape)
                     
-                    logger.info(f"[Rank {self.rank}] Received KV cache ({num_layers} layers)")
+                        logger.info(f"[Rank {self.rank}] Received KV cache ({num_layers} layers)")
                     
-                    # Do decode
-                    with profile_operation("decode_only", gpu_id, request_id, self.profiling_enabled):
-                        generated_ids, _ = generate(
-                            model=self.model,
-                            tokenizer=self.tokenizer,
-                            input_ids=input_ids,
-                            past_key_values=past_key_values,
-                            max_tokens=max_tokens,
-                            temperature=self.temperature,
-                        )
+                        # Do decode
+                        with profile_operation("decode_only", gpu_id, request_id, self.profiling_enabled):
+                            generated_ids, _ = generate(
+                                model=self.model,
+                                tokenizer=self.tokenizer,
+                                input_ids=input_ids,
+                                past_key_values=past_key_values,
+                                max_tokens=max_tokens,
+                                temperature=self.temperature,
+                            )
                         
-                        # Decode ONLY the new tokens (skip the input)
-                        input_length = input_ids.shape[1]
-                        new_tokens = generated_ids[0, input_length:]
-                        generated_text_only = self.tokenizer.decode(
-                            new_tokens,
-                            skip_special_tokens=True,
-                        )
+                            # Decode ONLY the new tokens (skip the input)
+                            input_length = input_ids.shape[1]
+                            new_tokens = generated_ids[0, input_length:]
+                            generated_text_only = self.tokenizer.decode(
+                                new_tokens,
+                                skip_special_tokens=True,
+                            )
                     
-                    logger.info(f"[Rank {self.rank}] Generated (new tokens only): {generated_text_only[:200]}...")
+                        logger.info(f"[Rank {self.rank}] Generated (new tokens only): {generated_text_only[:200]}...")
                     
-                    # Send ONLY generated text back to rank 0 via all_gather
-                    with profile_operation("send_response", gpu_id, request_id, self.profiling_enabled):
-                        max_text_len = 512  # Much smaller now
-                        text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
-                        encoded = self.tokenizer.encode(generated_text_only, add_special_tokens=False)[:max_text_len]
-                        text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
+                        # Send ONLY generated text back to rank 0 via all_gather
+                        with profile_operation("send_response", gpu_id, request_id, self.profiling_enabled):
+                            max_text_len = 512  # Much smaller now
+                            text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
+                            encoded = self.tokenizer.encode(generated_text_only, add_special_tokens=False)[:max_text_len]
+                            text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
                         
-                        gathered = [torch.zeros_like(text_tensor) for _ in range(4)]
-                        dist.all_gather(gathered, text_tensor)
-                        logger.info(f"[Rank {self.rank}] Sent response to all ranks")
+                            gathered = [torch.zeros_like(text_tensor) for _ in range(4)]
+                            dist.all_gather(gathered, text_tensor)
+                            logger.info(f"[Rank {self.rank}] Sent response to all ranks")
                         
-                    # Store for Phase 2
-                    stored_kv_cache = past_key_values
-                    stored_input_ids = input_ids
+                        # Store for Phase 2
+                        stored_kv_cache = past_key_values
+                        stored_input_ids = input_ids
                 
                 # ============================================================
                 # PHASE 2: JUDGE
@@ -197,69 +193,69 @@ class SimpleDecodeWorker:
                         f"batch_size={batch_size}, seq_len={seq_len}, max_tokens={max_tokens}"
                     )
                     
-                    if stored_kv_cache is None:
-                        logger.error(f"[Rank {self.rank}] No stored KV cache from Phase 1!")
-                        continue
+                    # Profile Phase 2
+                    with simple_profile(gpu_id, f"{request_id}_phase2", enabled=self.profiling_enabled):
                     
-                    # Mark request activity for continuous profiling
-                    if self.profiling_enabled:
-                        record_request_activity(gpu_id, "two_phase_session")
+                        if stored_kv_cache is None:
+                            logger.error(f"[Rank {self.rank}] No stored KV cache from Phase 1!")
+                            continue
                     
-                    # Receive ranking instruction
-                    with profile_operation("receive_ranking_prompt", gpu_id, request_id, self.profiling_enabled):
-                        ranking_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=self.device)
-                        dist.broadcast(ranking_ids, src=0)
+                        # Receive ranking instruction
+                        with profile_operation("receive_ranking_prompt", gpu_id, request_id, self.profiling_enabled):
+                            ranking_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=self.device)
+                            dist.broadcast(ranking_ids, src=0)
                     
-                    # Receive extended KV cache
-                    with profile_operation("receive_extended_kv", gpu_id, request_id, self.profiling_enabled):
-                        num_layers = self.model.config.num_hidden_layers
-                        num_heads = self.model.config.num_attention_heads
-                        head_dim = self.model.config.hidden_size // num_heads
+                        # Receive extended KV cache
+                        with profile_operation("receive_extended_kv", gpu_id, request_id, self.profiling_enabled):
+                            num_layers = self.model.config.num_hidden_layers
+                            num_heads = self.model.config.num_attention_heads
+                            head_dim = self.model.config.hidden_size // num_heads
                         
-                        # KV cache now has original + ranking tokens
-                        original_seq_len = stored_input_ids.shape[1]
-                        total_seq_len = original_seq_len + seq_len
+                            # KV cache now has original + ranking tokens
+                            original_seq_len = stored_input_ids.shape[1]
+                            total_seq_len = original_seq_len + seq_len
                         
-                        key_shape = (batch_size, num_heads, total_seq_len, head_dim)
-                        value_shape = (batch_size, num_heads, total_seq_len, head_dim)
+                            key_shape = (batch_size, num_heads, total_seq_len, head_dim)
+                            value_shape = (batch_size, num_heads, total_seq_len, head_dim)
                         
-                        extended_kv = self.receive_kv_cache(num_layers, key_shape, value_shape)
+                            extended_kv = self.receive_kv_cache(num_layers, key_shape, value_shape)
                     
-                    logger.info(f"[Rank {self.rank}] Received extended KV cache")
+                        logger.info(f"[Rank {self.rank}] Received extended KV cache")
                     
-                    # Generate ranking
-                    with profile_operation("decode_ranking", gpu_id, request_id, self.profiling_enabled):
-                        full_input_ids = torch.cat([stored_input_ids, ranking_ids], dim=1)
+                        # Generate ranking
+                        with profile_operation("decode_ranking", gpu_id, request_id, self.profiling_enabled):
+                            # KV cache already contains everything, just pass last token to start generation
+                            last_token = ranking_ids[:, -1:]
                         
-                        generated_ids, _ = generate(
-                            model=self.model,
-                            tokenizer=self.tokenizer,
-                            input_ids=full_input_ids,
-                            past_key_values=extended_kv,
-                            max_tokens=max_tokens,
-                            temperature=0.3,  # Lower temp for ranking
-                        )
+                            generated_ids, _ = generate(
+                                model=self.model,
+                                tokenizer=self.tokenizer,
+                                input_ids=last_token,
+                                past_key_values=extended_kv,
+                                max_tokens=max_tokens,
+                                temperature=0.3,  # Lower temp for ranking
+                            )
                         
-                        # Decode ONLY the new tokens (skip the full input)
-                        input_length = full_input_ids.shape[1]
-                        new_tokens = generated_ids[0, input_length:]
-                        ranking_output_only = self.tokenizer.decode(
-                            new_tokens,
-                            skip_special_tokens=True,
-                        )
+                            # Decode ONLY the new tokens (skip the last_token)
+                            input_length = last_token.shape[1]
+                            new_tokens = generated_ids[0, input_length:]
+                            ranking_output_only = self.tokenizer.decode(
+                                new_tokens,
+                                skip_special_tokens=True,
+                            )
                     
-                    logger.info(f"[Rank {self.rank}] Generated ranking (new tokens only): {ranking_output_only}")
+                        logger.info(f"[Rank {self.rank}] Generated ranking (new tokens only): {ranking_output_only}")
                     
-                    # Send ONLY ranking output back via all_gather
-                    with profile_operation("send_ranking", gpu_id, request_id, self.profiling_enabled):
-                        max_text_len = 256  # Rankings are short
-                        text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
-                        encoded = self.tokenizer.encode(ranking_output_only, add_special_tokens=False)[:max_text_len]
-                        text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
+                        # Send ONLY ranking output back via all_gather
+                        with profile_operation("send_ranking", gpu_id, request_id, self.profiling_enabled):
+                            max_text_len = 256  # Rankings are short
+                            text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
+                            encoded = self.tokenizer.encode(ranking_output_only, add_special_tokens=False)[:max_text_len]
+                            text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
                         
-                        gathered = [torch.zeros_like(text_tensor) for _ in range(4)]
-                        dist.all_gather(gathered, text_tensor)
-                        logger.info(f"[Rank {self.rank}] Sent ranking to all ranks")
+                            gathered = [torch.zeros_like(text_tensor) for _ in range(4)]
+                            dist.all_gather(gathered, text_tensor)
+                            logger.info(f"[Rank {self.rank}] Sent ranking to all ranks")
         
         except KeyboardInterrupt:
             logger.info(f"[Rank {self.rank}] Processed {request_count} requests, shutting down")

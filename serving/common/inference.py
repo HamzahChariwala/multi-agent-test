@@ -58,7 +58,12 @@ def decode_step(
     Returns:
         Tuple of (next_token_id, updated_past_key_values)
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"decode_step() starting: input_ids.shape={input_ids.shape}, attention_mask.shape={attention_mask.shape if attention_mask is not None else 'None'}")
+    
     with torch.no_grad():
+        logger.info(f"decode_step() calling model forward pass...")
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -66,6 +71,7 @@ def decode_step(
             use_cache=True,
             return_dict=True,
         )
+        logger.info(f"decode_step() model forward pass completed")
     
     # Get logits for last token
     logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
@@ -135,26 +141,41 @@ def generate(
     # Initialize with input
     generated_ids = input_ids.clone()
     
-    # Create attention mask
-    attention_mask = torch.ones_like(generated_ids)
-    
     # If no KV cache provided, do prefill
     if past_key_values is None:
+        attention_mask = torch.ones_like(generated_ids)
         _, past_key_values = prefill(model, input_ids, attention_mask)
         # Start generating from next position
         next_input_ids = input_ids[:, -1:]
     else:
-        # Use provided KV cache
+        # Use provided KV cache - attention mask must match FULL sequence length
+        # Get the sequence length from the KV cache
+        if hasattr(past_key_values, 'get_seq_length'):
+            kv_seq_len = past_key_values.get_seq_length()
+        elif hasattr(past_key_values, 'key_cache'):
+            kv_seq_len = past_key_values.key_cache[0].shape[2]  # [batch, heads, seq, dim]
+        else:
+            kv_seq_len = past_key_values[0][0].shape[2]
+        
+        # Create attention mask for the full sequence (KV cache + current input)
+        attention_mask = torch.ones((batch_size, kv_seq_len + input_ids.shape[1]), 
+                                    device=device, dtype=torch.long)
         next_input_ids = input_ids[:, -1:]
     
     # Stop tokens
     if stop_tokens is None:
         stop_tokens = [tokenizer.eos_token_id]
     
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"generate() starting: input_ids.shape={input_ids.shape}, attention_mask.shape={attention_mask.shape}, max_tokens={max_tokens}, past_key_values={'provided' if past_key_values is not None else 'None'}")
+    
     # Generation loop
     generated_tokens = []
-    for _ in range(max_tokens):
+    for i in range(max_tokens):
         # Decode one step
+        logger.info(f"generate() iteration {i}: next_input_ids.shape={next_input_ids.shape}, attention_mask.shape={attention_mask.shape}")
+        
         next_token, past_key_values = decode_step(
             model=model,
             input_ids=next_input_ids,
@@ -164,6 +185,8 @@ def generate(
             top_p=top_p,
             top_k=top_k,
         )
+        
+        logger.info(f"generate() iteration {i}: decode_step completed, next_token shape={next_token.shape}, token_id={next_token.item()}")
         
         # Append to generated sequence
         generated_ids = torch.cat([generated_ids, next_token], dim=1)

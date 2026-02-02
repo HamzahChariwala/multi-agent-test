@@ -14,17 +14,18 @@ import logging
 from fastapi import FastAPI
 import uvicorn
 from typing import List
+from transformers import DynamicCache
 
 from serving.common.model_loader import load_model
 from serving.common.inference import generate, format_prompt_for_model
 from serving.common.profiling import profile_operation, is_profiling_enabled
-from serving.common.continuous_profiler import get_manager, record_request_activity
+from serving.common.simple_profiling import simple_profile
 from serving.t4_cluster.kv_transfer import synchronize_ranks
 
 from schemas.generation import GenerationRequest, GenerationOutput
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -83,11 +84,8 @@ class PrefillServer:
         synchronize_ranks()
         logger.info(f"[Rank {self.rank}] All workers synchronized")
         
-        # Start continuous profiler monitoring
-        if self.profiling_enabled:
-            manager = get_manager(idle_timeout=30.0)
-            manager.start_monitoring()
-            logger.info(f"[Rank {self.rank}] Started continuous profiler monitoring")
+        # Profiling enabled: {self.profiling_enabled}
+        logger.info(f"[Rank {self.rank}] Profiling enabled: {self.profiling_enabled}")
     
     async def health_check(self):
         """Health check endpoint."""
@@ -108,140 +106,187 @@ class PrefillServer:
         
         gpu_id = "t4_gpu0"
         
-        # Mark request activity for continuous profiling
-        if self.profiling_enabled:
-            record_request_activity(gpu_id, "two_phase_session")
+        # Profile entire Phase 2
+        with simple_profile(gpu_id, f"{request.request_id}_phase2", enabled=self.profiling_enabled):
         
-        # Format all responses as A, B, C, D
-        with profile_operation("format_ranking_prompt", gpu_id, request.request_id, self.profiling_enabled):
-            ranking_text = "\n\nHere are the responses from all council members:\n\n"
-            for idx, resp in enumerate(self.member_responses):
-                label = chr(65 + idx)  # A, B, C, D
-                ranking_text += f"[{label}] {resp['answer']}\n\n"
+            # Format all responses as A, B, C, D
+            with profile_operation("format_ranking_prompt", gpu_id, request.request_id, self.profiling_enabled):
+                ranking_text = "\n\nHere are the responses from all council members:\n\n"
+                for idx, resp in enumerate(self.member_responses):
+                    label = chr(65 + idx)  # A, B, C, D
+                    ranking_text += f"[{label}] {resp['answer']}\n\n"
             
-            ranking_text += (
-                "Rank these responses from best to worst by listing only the letters "
-                "in order (e.g., 'B A D C'). Provide ONLY the ranking with no explanation:"
-            )
-            
-            logger.info(f"[Rank {self.rank}] Ranking prompt: {ranking_text[:200]}...")
-        
-        # Tokenize the ranking instruction
-        with profile_operation("tokenize_ranking", gpu_id, request.request_id, self.profiling_enabled):
-            encoded = self.tokenizer(
-                ranking_text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            )
-            ranking_ids = encoded["input_ids"].to(self.device)
-            attention_mask = encoded.get("attention_mask", torch.ones_like(ranking_ids)).to(self.device)
-        
-        batch_size, new_seq_len = ranking_ids.shape
-        
-        # Broadcast judging metadata to workers
-        with profile_operation("signal_judging", gpu_id, request.request_id, self.profiling_enabled):
-            # [phase=2, batch_size, seq_len, max_tokens]
-            metadata = torch.tensor(
-                [2, batch_size, new_seq_len, request.max_tokens],
-                dtype=torch.long,
-                device=self.device
-            )
-            dist.broadcast(metadata, src=0)
-            
-            # Broadcast ranking instruction tokens
-            dist.broadcast(ranking_ids.contiguous(), src=0)
-            logger.info(f"[Rank {self.rank}] Broadcasted ranking instruction")
-        
-        # Append to existing KV cache by running prefill on new tokens
-        with profile_operation("prefill_ranking", gpu_id, request.request_id, self.profiling_enabled):
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=ranking_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=self.current_kv_cache,
-                    use_cache=True,
+                ranking_text += (
+                    "Rank these responses from best to worst by listing only the letters "
+                    "in order (e.g., 'B A D C'). Provide ONLY the ranking with no explanation:"
                 )
-                updated_kv_cache = outputs.past_key_values
-                
-            logger.info(f"[Rank {self.rank}] Extended KV cache with ranking instruction")
-        
-        # Broadcast the EXTENDED KV cache
-        with profile_operation("broadcast_extended_kv", gpu_id, request.request_id, self.profiling_enabled):
-            if hasattr(updated_kv_cache, 'key_cache'):
-                kv_list = [(updated_kv_cache.key_cache[i], updated_kv_cache.value_cache[i]) 
-                           for i in range(len(updated_kv_cache.key_cache))]
-            else:
-                kv_list = updated_kv_cache
             
-            for layer_idx, kv_pair in enumerate(kv_list):
-                if isinstance(kv_pair, (tuple, list)):
-                    key_cache = kv_pair[0]
-                    value_cache = kv_pair[1]
+                logger.info(f"[Rank {self.rank}] Ranking prompt: {ranking_text[:200]}...")
+        
+            # Tokenize the ranking instruction
+            with profile_operation("tokenize_ranking", gpu_id, request.request_id, self.profiling_enabled):
+                encoded = self.tokenizer(
+                    ranking_text,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                )
+                ranking_ids = encoded["input_ids"].to(self.device)
+        
+            batch_size, new_seq_len = ranking_ids.shape
+        
+            # Broadcast judging metadata to workers
+            with profile_operation("signal_judging", gpu_id, request.request_id, self.profiling_enabled):
+                # [phase=2, batch_size, seq_len, max_tokens]
+                metadata = torch.tensor(
+                    [2, batch_size, new_seq_len, request.max_tokens],
+                    dtype=torch.long,
+                    device=self.device
+                )
+                dist.broadcast(metadata, src=0)
+            
+                # Broadcast ranking instruction tokens
+                dist.broadcast(ranking_ids.contiguous(), src=0)
+                logger.info(f"[Rank {self.rank}] Broadcasted ranking instruction")
+        
+            # Append to existing KV cache by running prefill on new tokens
+            with profile_operation("prefill_ranking", gpu_id, request.request_id, self.profiling_enabled):
+                # Convert stored KV cache to DynamicCache if it's in tuple format
+                if not hasattr(self.current_kv_cache, 'key_cache'):
+                    # Convert tuple format to DynamicCache
+                    dynamic_cache = DynamicCache()
+                    for layer_idx, kv_pair in enumerate(self.current_kv_cache):
+                        if isinstance(kv_pair, (tuple, list)):
+                            key, value = kv_pair[0], kv_pair[1]
+                            dynamic_cache.update(key, value, layer_idx)
+                    kv_for_prefill = dynamic_cache
                 else:
-                    raise ValueError(f"Cannot unpack KV cache at layer {layer_idx}")
+                    kv_for_prefill = self.current_kv_cache
                 
-                dist.broadcast(key_cache.contiguous(), src=0)
-                dist.broadcast(value_cache.contiguous(), src=0)
-            
-            logger.info(f"[Rank {self.rank}] Broadcasted extended KV cache")
-        
-        # Generate ranking on GPU 0
-        with profile_operation("decode_ranking", gpu_id, request.request_id, self.profiling_enabled):
-            # Concatenate original input with ranking instruction
-            full_input_ids = torch.cat([self.current_input_ids, ranking_ids], dim=1)
-            
-            generated_ids, _ = generate(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                input_ids=full_input_ids,
-                past_key_values=updated_kv_cache,
-                max_tokens=request.max_tokens,
-                temperature=0.3,  # Lower temp for more consistent rankings
-            )
-            
-            # Decode ONLY the new tokens (skip the full input)
-            input_length = full_input_ids.shape[1]
-            new_tokens = generated_ids[0, input_length:]
-            ranking_output_only = self.tokenizer.decode(
-                new_tokens,
-                skip_special_tokens=True,
-            )
-        
-        logger.info(f"[Rank {self.rank}] Generated ranking (new tokens only): {ranking_output_only}")
-        
-        # Collect rankings from all workers
-        with profile_operation("collect_rankings", gpu_id, request.request_id, self.profiling_enabled):
-            max_text_len = 256  # Rankings are short
-            text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
-            encoded = self.tokenizer.encode(ranking_output_only, add_special_tokens=False)[:max_text_len]
-            text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
-            
-            gathered_rankings = [torch.zeros_like(text_tensor) for _ in range(self.world_size)]
-            dist.all_gather(gathered_rankings, text_tensor)
-            
-            all_rankings = []
-            for rank_idx, text_tensor in enumerate(gathered_rankings):
-                nonzero = torch.nonzero(text_tensor)
-                if len(nonzero) > 0:
-                    actual_len = nonzero[-1].item() + 1
+                # Create attention mask for FULL sequence (existing KV + new tokens)
+                if hasattr(kv_for_prefill, 'get_seq_length'):
+                    kv_seq_len = kv_for_prefill.get_seq_length()
+                elif hasattr(kv_for_prefill, 'key_cache'):
+                    kv_seq_len = kv_for_prefill.key_cache[0].shape[2]
                 else:
-                    actual_len = 0
+                    kv_seq_len = kv_for_prefill[0][0].shape[2]
                 
-                decoded = self.tokenizer.decode(
-                    text_tensor[:actual_len].cpu().tolist(),
-                    skip_special_tokens=True
+                # Attention mask must cover: [existing_kv_tokens | new_ranking_tokens]
+                attention_mask = torch.ones((batch_size, kv_seq_len + new_seq_len), 
+                                           dtype=torch.long, device=self.device)
+                
+                logger.info(f"[Rank {self.rank}] Phase 2 prefill: kv_seq_len={kv_seq_len}, new_tokens={new_seq_len}, attention_mask.shape={attention_mask.shape}")
+                
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=ranking_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=kv_for_prefill,
+                        use_cache=True,
+                    )
+                    updated_kv_cache = outputs.past_key_values
+                    
+                    logger.info(f"[Rank {self.rank}] Extended KV cache with ranking instruction")
+            
+            # Broadcast the EXTENDED KV cache
+            with profile_operation("broadcast_extended_kv", gpu_id, request.request_id, self.profiling_enabled):
+                if hasattr(updated_kv_cache, 'key_cache'):
+                    kv_list = [(updated_kv_cache.key_cache[i], updated_kv_cache.value_cache[i]) 
+                               for i in range(len(updated_kv_cache.key_cache))]
+                else:
+                    kv_list = updated_kv_cache
+                
+                for layer_idx, kv_pair in enumerate(kv_list):
+                    if isinstance(kv_pair, (tuple, list)):
+                        key_cache = kv_pair[0]
+                        value_cache = kv_pair[1]
+                    else:
+                        raise ValueError(f"Cannot unpack KV cache at layer {layer_idx}")
+                    
+                    dist.broadcast(key_cache.contiguous(), src=0)
+                    dist.broadcast(value_cache.contiguous(), src=0)
+                
+                logger.info(f"[Rank {self.rank}] Broadcasted extended KV cache")
+            
+            # Generate ranking on GPU 0
+            kv_len = updated_kv_cache.get_seq_length() if hasattr(updated_kv_cache, 'get_seq_length') else "unknown"
+            logger.info(f"[Rank {self.rank}] Phase 2: KV cache seq_len={kv_len}, ranking_ids.shape={ranking_ids.shape}")
+            
+            # Memory debugging
+            mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9
+            mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+            mem_free = (torch.cuda.get_device_properties(self.device).total_memory - torch.cuda.memory_allocated(self.device)) / 1e9
+            logger.info(f"[Rank {self.rank}] GPU memory before generation: allocated={mem_allocated:.2f}GB, reserved={mem_reserved:.2f}GB, free={mem_free:.2f}GB")
+            
+            # Free old KV cache if it's still in scope
+            if 'kv_for_prefill' in locals():
+                del kv_for_prefill
+            torch.cuda.empty_cache()
+            
+            mem_allocated_after = torch.cuda.memory_allocated(self.device) / 1e9
+            mem_reserved_after = torch.cuda.memory_reserved(self.device) / 1e9
+            mem_free_after = (torch.cuda.get_device_properties(self.device).total_memory - torch.cuda.memory_allocated(self.device)) / 1e9
+            logger.info(f"[Rank {self.rank}] GPU memory after cache clear: allocated={mem_allocated_after:.2f}GB, reserved={mem_reserved_after:.2f}GB, free={mem_free_after:.2f}GB")
+            
+            with profile_operation("decode_ranking", gpu_id, request.request_id, self.profiling_enabled):
+                # KV cache already contains everything, just pass last token to start generation
+                last_token = ranking_ids[:, -1:]
+                
+                logger.info(f"[Rank {self.rank}] Starting ranking generation with last_token shape: {last_token.shape}")
+                
+                generated_ids, _ = generate(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    input_ids=last_token,
+                    past_key_values=updated_kv_cache,
+                    max_tokens=request.max_tokens,
+                    temperature=0.3,  # Lower temp for more consistent rankings
                 )
                 
-                all_rankings.append({
-                    "judge_id": f"member_{rank_idx}",
-                    "ranking": decoded,
-                })
+                logger.info(f"[Rank {self.rank}] Ranking generation complete, generated_ids shape: {generated_ids.shape}")
                 
-                logger.info(f"[Rank {self.rank}] Collected ranking from rank {rank_idx}: {decoded}")
-        
-        logger.info(f"[Rank {self.rank}] Completed judging phase")
+                # Decode ONLY the new tokens (skip the last_token)
+                input_length = last_token.shape[1]
+                new_tokens = generated_ids[0, input_length:]
+                ranking_output_only = self.tokenizer.decode(
+                    new_tokens,
+                    skip_special_tokens=True,
+                )
+            
+            logger.info(f"[Rank {self.rank}] Generated ranking (new tokens only): {ranking_output_only}")
+            
+            # Collect rankings from all workers
+            with profile_operation("collect_rankings", gpu_id, request.request_id, self.profiling_enabled):
+                max_text_len = 256  # Rankings are short
+                text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
+                encoded = self.tokenizer.encode(ranking_output_only, add_special_tokens=False)[:max_text_len]
+                text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
+                
+                gathered_rankings = [torch.zeros_like(text_tensor) for _ in range(self.world_size)]
+                dist.all_gather(gathered_rankings, text_tensor)
+                
+                all_rankings = []
+                for rank_idx, text_tensor in enumerate(gathered_rankings):
+                    nonzero = torch.nonzero(text_tensor)
+                    if len(nonzero) > 0:
+                        actual_len = nonzero[-1].item() + 1
+                    else:
+                        actual_len = 0
+                    
+                    decoded = self.tokenizer.decode(
+                        text_tensor[:actual_len].cpu().tolist(),
+                        skip_special_tokens=True
+                    )
+                    
+                    all_rankings.append({
+                        "judge_id": f"member_{rank_idx}",
+                        "ranking": decoded,
+                    })
+                    
+                    logger.info(f"[Rank {self.rank}] Collected ranking from rank {rank_idx}: {decoded}")
+            
+            logger.info(f"[Rank {self.rank}] Completed judging phase")
         
         return {
             "rankings": all_rankings,
@@ -260,153 +305,152 @@ class PrefillServer:
         
         gpu_id = "t4_gpu0"
         
-        # Mark request activity for continuous profiling
-        if self.profiling_enabled:
-            record_request_activity(gpu_id, "two_phase_session")
+        # Profile entire Phase 1
+        with simple_profile(gpu_id, f"{request.request_id}_phase1", enabled=self.profiling_enabled):
         
-        # Format prompt
-        with profile_operation("format_prompt", gpu_id, request.request_id, self.profiling_enabled):
-            prompt = format_prompt_for_model(request.task_prompt, self.model_name)
+            # Format prompt
+            with profile_operation("format_prompt", gpu_id, request.request_id, self.profiling_enabled):
+                prompt = format_prompt_for_model(request.task_prompt, self.model_name)
         
-        # Tokenize
-        with profile_operation("tokenize", gpu_id, request.request_id, self.profiling_enabled):
-            encoded = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            )
-            input_ids = encoded["input_ids"].to(self.device)
-            attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(self.device)
+            # Tokenize
+            with profile_operation("tokenize", gpu_id, request.request_id, self.profiling_enabled):
+                encoded = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                )
+                input_ids = encoded["input_ids"].to(self.device)
+                attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(self.device)
         
-        batch_size, seq_len = input_ids.shape
+            batch_size, seq_len = input_ids.shape
         
-        # Signal decode workers that Phase 1 (Generate) is starting
-        with profile_operation("signal_workers", gpu_id, request.request_id, self.profiling_enabled):
-            # [phase=1 (generate), batch_size, seq_len, max_tokens]
-            metadata = torch.tensor(
-                [1, batch_size, seq_len, request.max_tokens],
-                dtype=torch.long,
-                device=self.device
-            )
-            dist.broadcast(metadata, src=0)
-            logger.info(f"[Rank {self.rank}] Broadcasted Phase 1 metadata to workers")
+            # Signal decode workers that Phase 1 (Generate) is starting
+            with profile_operation("signal_workers", gpu_id, request.request_id, self.profiling_enabled):
+                # [phase=1 (generate), batch_size, seq_len, max_tokens]
+                metadata = torch.tensor(
+                    [1, batch_size, seq_len, request.max_tokens],
+                    dtype=torch.long,
+                    device=self.device
+                )
+                dist.broadcast(metadata, src=0)
+                logger.info(f"[Rank {self.rank}] Broadcasted Phase 1 metadata to workers")
             
-            # Broadcast input_ids
-            dist.broadcast(input_ids.contiguous(), src=0)
-            logger.info(f"[Rank {self.rank}] Broadcasted input_ids")
+                # Broadcast input_ids
+                dist.broadcast(input_ids.contiguous(), src=0)
+                logger.info(f"[Rank {self.rank}] Broadcasted input_ids")
         
-        # Do prefill to generate KV cache
-        with profile_operation("prefill", gpu_id, request.request_id, self.profiling_enabled):
-            with torch.no_grad():
-                outputs = self.model(
+            # Do prefill to generate KV cache
+            with profile_operation("prefill", gpu_id, request.request_id, self.profiling_enabled):
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=True,
+                    )
+                    past_key_values = outputs.past_key_values
+                
+                logger.info(f"[Rank {self.rank}] Prefill complete, got {len(past_key_values)} layers of KV cache")
+        
+            # Broadcast KV cache to all decode workers
+            with profile_operation("broadcast_kv", gpu_id, request.request_id, self.profiling_enabled):
+                # past_key_values can be tuple of tuples or DynamicCache
+                # Convert to tuple format if needed
+                if hasattr(past_key_values, 'key_cache'):
+                    # It's a DynamicCache object
+                    kv_list = [(past_key_values.key_cache[i], past_key_values.value_cache[i]) 
+                               for i in range(len(past_key_values.key_cache))]
+                else:
+                    # Already in tuple format
+                    kv_list = past_key_values
+            
+                for layer_idx, kv_pair in enumerate(kv_list):
+                    # Handle different formats - Phi-2 returns (key, value, ...) tuples
+                    if isinstance(kv_pair, (tuple, list)):
+                        # Just take first two elements (key and value)
+                        key_cache = kv_pair[0]
+                        value_cache = kv_pair[1]
+                    else:
+                        # Log structure for debugging
+                        logger.error(f"[Rank {self.rank}] Unexpected KV structure at layer {layer_idx}: {type(kv_pair)}")
+                        raise ValueError(f"Cannot unpack KV cache at layer {layer_idx}")
+                
+                    dist.broadcast(key_cache.contiguous(), src=0)
+                    dist.broadcast(value_cache.contiguous(), src=0)
+                
+                logger.info(f"[Rank {self.rank}] Broadcasted KV cache ({len(kv_list)} layers)")
+        
+            # Do decode on GPU 0 as well
+            with profile_operation("decode", gpu_id, request.request_id, self.profiling_enabled):
+                generated_ids, _ = generate(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=True,
+                    past_key_values=past_key_values,
+                    max_tokens=request.max_tokens,
+                    temperature=0.7,
                 )
-                past_key_values = outputs.past_key_values
-                
-            logger.info(f"[Rank {self.rank}] Prefill complete, got {len(past_key_values)} layers of KV cache")
-        
-        # Broadcast KV cache to all decode workers
-        with profile_operation("broadcast_kv", gpu_id, request.request_id, self.profiling_enabled):
-            # past_key_values can be tuple of tuples or DynamicCache
-            # Convert to tuple format if needed
-            if hasattr(past_key_values, 'key_cache'):
-                # It's a DynamicCache object
-                kv_list = [(past_key_values.key_cache[i], past_key_values.value_cache[i]) 
-                           for i in range(len(past_key_values.key_cache))]
-            else:
-                # Already in tuple format
-                kv_list = past_key_values
             
-            for layer_idx, kv_pair in enumerate(kv_list):
-                # Handle different formats - Phi-2 returns (key, value, ...) tuples
-                if isinstance(kv_pair, (tuple, list)):
-                    # Just take first two elements (key and value)
-                    key_cache = kv_pair[0]
-                    value_cache = kv_pair[1]
-                else:
-                    # Log structure for debugging
-                    logger.error(f"[Rank {self.rank}] Unexpected KV structure at layer {layer_idx}: {type(kv_pair)}")
-                    raise ValueError(f"Cannot unpack KV cache at layer {layer_idx}")
-                
-                dist.broadcast(key_cache.contiguous(), src=0)
-                dist.broadcast(value_cache.contiguous(), src=0)
-                
-            logger.info(f"[Rank {self.rank}] Broadcasted KV cache ({len(kv_list)} layers)")
-        
-        # Do decode on GPU 0 as well
-        with profile_operation("decode", gpu_id, request.request_id, self.profiling_enabled):
-            generated_ids, _ = generate(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                max_tokens=request.max_tokens,
-                temperature=0.7,
-            )
-            
-            # Decode ONLY the new tokens (skip the input)
-            input_length = input_ids.shape[1]
-            new_tokens = generated_ids[0, input_length:]
-            generated_text_only = self.tokenizer.decode(
-                new_tokens,
-                skip_special_tokens=True,
-            )
-        
-        logger.info(f"[Rank {self.rank}] Completed full request")
-        logger.info(f"[Rank {self.rank}] Generated (new tokens only): {generated_text_only[:200]}...")
-        
-        # Collect responses from all workers
-        with profile_operation("collect_responses", gpu_id, request.request_id, self.profiling_enabled):
-            # Encode ONLY the new tokens to send (use fixed max length)
-            max_text_len = 512  # Much smaller now since we're only sending generated portion
-            text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
-            encoded = self.tokenizer.encode(generated_text_only, add_special_tokens=False)[:max_text_len]
-            text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
-            
-            # Gather from all ranks
-            gathered_texts = [torch.zeros_like(text_tensor) for _ in range(self.world_size)]
-            dist.all_gather(gathered_texts, text_tensor)
-            
-            # Decode all responses
-            self.member_responses = []
-            for rank_idx, text_tensor in enumerate(gathered_texts):
-                # Find actual length (stop at first padding/zero)
-                nonzero = torch.nonzero(text_tensor)
-                if len(nonzero) > 0:
-                    actual_len = nonzero[-1].item() + 1
-                else:
-                    actual_len = 0
-                
-                decoded = self.tokenizer.decode(
-                    text_tensor[:actual_len].cpu().tolist(),
-                    skip_special_tokens=True
+                # Decode ONLY the new tokens (skip the input)
+                input_length = input_ids.shape[1]
+                new_tokens = generated_ids[0, input_length:]
+                generated_text_only = self.tokenizer.decode(
+                    new_tokens,
+                    skip_special_tokens=True,
                 )
-                
-                self.member_responses.append({
-                    "member_id": f"member_{rank_idx}",
-                    "answer": decoded,
-                    "confidence": 0.8,
-                })
-                
-                logger.info(f"[Rank {self.rank}] Collected from rank {rank_idx}: {decoded[:100]}...")
+        
+            logger.info(f"[Rank {self.rank}] Completed full request")
+            logger.info(f"[Rank {self.rank}] Generated (new tokens only): {generated_text_only[:200]}...")
+        
+            # Collect responses from all workers
+            with profile_operation("collect_responses", gpu_id, request.request_id, self.profiling_enabled):
+                # Encode ONLY the new tokens to send (use fixed max length)
+                max_text_len = 512  # Much smaller now since we're only sending generated portion
+                text_tensor = torch.zeros(max_text_len, dtype=torch.long, device=self.device)
+                encoded = self.tokenizer.encode(generated_text_only, add_special_tokens=False)[:max_text_len]
+                text_tensor[:len(encoded)] = torch.tensor(encoded, device=self.device)
             
-        # Store KV cache for Phase 2
-        self.current_kv_cache = past_key_values
-        self.current_input_ids = input_ids
+                # Gather from all ranks
+                gathered_texts = [torch.zeros_like(text_tensor) for _ in range(self.world_size)]
+                dist.all_gather(gathered_texts, text_tensor)
+            
+                # Decode all responses
+                self.member_responses = []
+                for rank_idx, text_tensor in enumerate(gathered_texts):
+                    # Find actual length (stop at first padding/zero)
+                    nonzero = torch.nonzero(text_tensor)
+                    if len(nonzero) > 0:
+                        actual_len = nonzero[-1].item() + 1
+                    else:
+                        actual_len = 0
+                
+                    decoded = self.tokenizer.decode(
+                        text_tensor[:actual_len].cpu().tolist(),
+                        skip_special_tokens=True
+                    )
+                
+                    self.member_responses.append({
+                        "member_id": f"member_{rank_idx}",
+                        "answer": decoded,
+                        "confidence": 0.8,
+                    })
+                
+                    logger.info(f"[Rank {self.rank}] Collected from rank {rank_idx}: {decoded[:100]}...")
+            
+            # Store KV cache for Phase 2
+            self.current_kv_cache = past_key_values
+            self.current_input_ids = input_ids
         
-        logger.info(f"[Rank {self.rank}] Stored KV cache for judging phase")
+            logger.info(f"[Rank {self.rank}] Stored KV cache for judging phase")
         
-        return {
-            "answer": generated_text_only,
-            "member_id": "member_0",
-            "confidence": 0.8,
-            "request_id": request.request_id,
-            "member_responses": self.member_responses,
-        }
+            return {
+                "answer": generated_text_only,
+                "member_id": "member_0",
+                "confidence": 0.8,
+                "request_id": request.request_id,
+                "member_responses": self.member_responses,
+            }
     
     def run(self, port: int = 8000):
         """Run HTTP server."""

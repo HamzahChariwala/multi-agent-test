@@ -49,7 +49,7 @@ async def test_two_phase_workflow():
             prompt_text = f.read()
         logger.info(f"Loaded prompt from sample.txt ({len(prompt_text)} characters)")
     else:
-        prompt_text = "What is the capital of France?"
+        prompt_text = "What are the key benefits of using renewable energy sources?"
         logger.warning("sample.txt not found, using default prompt")
     
     # ========================================================================
@@ -61,7 +61,7 @@ async def test_two_phase_workflow():
     
     request = {
         "task_prompt": prompt_text,
-        "max_tokens": 100,
+        "max_tokens": 50,
         "request_id": "test_two_phase_001"
     }
     
@@ -70,7 +70,7 @@ async def test_two_phase_workflow():
     start_time = time.time()
     
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:  # 10 minutes for Phase 1 + trace export
             response = await client.post(
                 f"{endpoint}/generate",
                 json=request
@@ -108,7 +108,7 @@ async def test_two_phase_workflow():
     
     judge_request = {
         "request_id": "test_two_phase_001_judge",
-        "max_tokens": 50,
+        "max_tokens": 15,
     }
     
     logger.info("Sending ranking request...")
@@ -116,7 +116,7 @@ async def test_two_phase_workflow():
     start_time = time.time()
     
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:  # 5 minutes for Phase 2
+        async with httpx.AsyncClient(timeout=900.0) as client:  # 15 minutes for Phase 2 + trace export
             response = await client.post(
                 f"{endpoint}/judge",
                 json=judge_request

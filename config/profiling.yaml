@@ -1,6 +1,8 @@
 enabled: true
 output_base_dir: "./profiling_traces"
 
+# NOTE: Per-phase profiling - each HTTP request gets its own trace files
+
 # Per-GPU profiling settings
 # Each GPU generates ONE continuous trace per request, capturing all operations
 gpus:

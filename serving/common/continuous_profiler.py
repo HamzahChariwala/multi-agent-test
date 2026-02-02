@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ContinuousProfiler:
     """
     Profiler that runs continuously across requests with idle timeout.
-    Exports traces only after 30 seconds of inactivity.
+    Exports traces only after idle_timeout seconds of inactivity.
     """
     
     def __init__(
@@ -111,7 +111,7 @@ class ContinuousProfiler:
             )
         
         self.profiler = torch.profiler.profile(**profiler_kwargs)
-        self.profiler.__enter__()
+        self.profiler_context = self.profiler.__enter__()
         
         self.is_active = True
         self.last_activity = time.time()
@@ -150,7 +150,7 @@ class ContinuousProfiler:
         
         logger.info(f"[{self.gpu_id}] Exporting continuous profiler traces")
         
-        # Stop ExecutionTraceObserver
+        # Stop ExecutionTraceObserver FIRST
         if self.et_observer is not None:
             try:
                 self.et_observer.stop()
@@ -159,23 +159,23 @@ class ContinuousProfiler:
             except Exception as e:
                 logger.warning(f"[{self.gpu_id}] Could not export ExecutionTrace: {e}")
         
-        # Stop profiler and export Chrome trace
+        # Stop profiler SECOND
         if self.profiler is not None:
             try:
-                # Export Chrome trace BEFORE stopping the profiler
+                self.profiler.__exit__(None, None, None)
+            except Exception as e:
+                logger.warning(f"[{self.gpu_id}] Could not stop profiler: {e}")
+        
+        # Export Chrome trace LAST (after __exit__, this is required when using ET Observer)
+        if self.profiler is not None:
+            try:
                 trace_file = self.output_dir / f"{self.session_id}_trace.json"
                 self.profiler.export_chrome_trace(str(trace_file))
                 logger.info(f"[{self.gpu_id}] Exported Chrome trace to: {trace_file}")
-                
-                # Now stop the profiler
-                self.profiler.__exit__(None, None, None)
             except Exception as e:
                 logger.warning(f"[{self.gpu_id}] Could not export Chrome trace: {e}")
-                # Still try to stop the profiler even if export failed
-                try:
-                    self.profiler.__exit__(None, None, None)
-                except:
-                    pass
+                import traceback
+                logger.warning(f"[{self.gpu_id}] Full traceback: {traceback.format_exc()}")
         
         self.is_active = False
         self.profiler = None
